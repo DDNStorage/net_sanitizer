@@ -12,6 +12,7 @@
 #include <string.h>
 #include <getopt.h>
 #include <libgen.h>
+#include <assert.h>
 
 #define NITERS (1024)
 #define NFLIGHT 1
@@ -60,12 +61,12 @@ struct results
 
 struct test_config
 {
-    char *s_buffer;
-    char *r_buffer;
     int curr_iter;
     int data_size;
     int niters;
     int nflight;
+    void *s_buffer;
+    void *r_buffer;
 };
 
 #define RESULTS_PRINT_HEADER                                                   \
@@ -133,6 +134,29 @@ static void print_results_verbose(const struct test_config *config,
     fflush(stdout);
 }
 
+static void *mallocz(const int size)
+{
+    void *p = NULL;
+
+    int rc = posix_memalign(&p, 4096, size);
+    if (rc == 0 && p)
+        memset(p, 0, size);
+    return p;
+}
+
+static void* allocate_buffer(const size_t size)
+{
+    void *ptr =  mallocz(size);
+    assert(ptr);
+
+    return ptr;
+}
+
+static void destroy_buffer(void *ptr)
+{
+    free(ptr);
+}
+
 static double client(const struct test_config *config)
 {
     double start, end, srv_start, srv_end;
@@ -147,7 +171,6 @@ static double client(const struct test_config *config)
     char *r_buffer      = config->r_buffer;
 
     memset(&srv_exec_time[0], 0, npeers * sizeof(double));
-
 
     if (my.output_mode == OUTPUT_VERBOSE)
         print_header_verbose(config);
@@ -251,30 +274,6 @@ static double server(const struct test_config *config)
 
     end = MPI_Wtime();
     return end - start;
-}
-
-static void *mallocz(const int size)
-{
-    void *p = malloc(size);
-    if (p)
-        memset(p, 0, size);
-    return p;
-}
-
-static void allocate_buffers(struct test_config *config,
-                             const size_t size)
-{
-    config->r_buffer = mallocz(size);
-    config->s_buffer = mallocz(size);
-}
-
-static void destroy_buffers(struct test_config *config)
-{
-    free(config->r_buffer);
-    config->r_buffer = NULL;
-
-    free(config->s_buffer);
-    config->s_buffer = NULL;
 }
 
 static void init_test(const int curr_iter,
@@ -447,10 +446,11 @@ static void test_client_server(int start_size, int end_size)
     int npeers = my.glob_rank < my.nservers ? my.nclients : my.nservers;
 
     /* Allocate buffers */
-    allocate_buffers(&test_config, npeers * end_size);
+    test_config.s_buffer = allocate_buffer(end_size * npeers);
+    test_config.r_buffer = allocate_buffer(end_size * npeers);
 
     /* Warmup test */
-    init_test(-1, my.niters, my.nflight, 0, &test_config);
+    init_test(-1, my.niters, my.nflight, end_size, &test_config);
     run_test_client_server(&test_config, NULL);
 
     for (curr_size = start_size; curr_size <= end_size; curr_size*=2)
@@ -472,33 +472,35 @@ static void test_client_server(int start_size, int end_size)
         }
     }
 
-    destroy_buffers(&test_config);
+    destroy_buffer(test_config.s_buffer);
+    destroy_buffer(test_config.r_buffer);
 }
 
 static double run_test_alltoall(const struct test_config *config)
 {
     double start, end;
-    int i, j, k;
+    int distance, j, k;
     double total_exec_time = 0;
     int npeers = my.nclients;
 
     const int niters    = config->niters;
     const int data_size = config->data_size;
+    const int nflight   = config->nflight;
     char *s_buffer      = config->s_buffer;
     char *r_buffer      = config->r_buffer;
-    const int nflight   = config->nflight;
 
-    MPI_Request reqs[nflight * 2];
+    MPI_Request reqs[2 * nflight];
 
     if (my.output_mode == OUTPUT_VERBOSE)
         print_header_verbose(config);
 
-    for (i = 1; i < npeers; i++)
+    for (distance = 1; distance < npeers; distance++)
     {
-        MPI_Barrier(MPI_COMM_WORLD);
+        int prev_rank = ((my.glob_rank - distance + npeers) % npeers);
+        int next_rank = (my.glob_rank + distance) % npeers;
 
-        int prev_rank = (my.glob_rank + i) % npeers;
-        int next_rank = ((my.glob_rank - i + npeers) % npeers);
+        MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+        MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
         start = MPI_Wtime();
 
@@ -506,11 +508,11 @@ static double run_test_alltoall(const struct test_config *config)
         {
             for (k = 0; j < niters && k < nflight; j++, k++)
             {
-                MPI_CHECK(MPI_Irecv(&r_buffer[data_size * prev_rank], data_size,
+                MPI_CHECK(MPI_Irecv(&r_buffer[data_size * k], data_size,
                                     MPI_CHAR, prev_rank, 0, MPI_COMM_WORLD,
                                     &reqs[k * 2]));
 
-                MPI_CHECK(MPI_Isend(&s_buffer[data_size * next_rank], data_size,
+                MPI_CHECK(MPI_Isend(&s_buffer[data_size * k], data_size,
                                    MPI_CHAR, next_rank, 0, MPI_COMM_WORLD,
                                    &reqs[k * 2 + 1]));
             }
@@ -524,9 +526,8 @@ static double run_test_alltoall(const struct test_config *config)
         if (my.output_mode == OUTPUT_VERBOSE)
         {
             struct results res;
-
             generate_results(config, 1, (end - start), &res);
-            print_results_verbose(config, i, &res);
+            print_results_verbose(config, next_rank, &res);
         }
     }
 
@@ -541,10 +542,11 @@ static void test_alltoall(int start_size, int end_size)
     int npeers = my.nclients - 1;
 
     /* Allocate buffers */
-    allocate_buffers(&test_config, my.nclients * end_size);
+    test_config.s_buffer = allocate_buffer(end_size * my.nflight);
+    test_config.r_buffer = allocate_buffer(end_size * my.nflight);
 
     /* Warmup test */
-    init_test(-1, my.niters, my.nflight, 0, &test_config);
+    init_test(-1, my.niters, my.nflight, end_size, &test_config);
     run_test_alltoall(&test_config);
 
     for (curr_size = start_size; curr_size <= end_size; curr_size *= 2)
@@ -556,7 +558,6 @@ static void test_alltoall(int start_size, int end_size)
                   my.niters, my.nflight, curr_size,
                   &test_config);
 
-        MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
         exec_time = run_test_alltoall(&test_config);
 
         if (my.output_mode == OUTPUT_MPI)
@@ -566,7 +567,8 @@ static void test_alltoall(int start_size, int end_size)
         }
     }
 
-    destroy_buffers(&test_config);
+    destroy_buffer(test_config.s_buffer);
+    destroy_buffer(test_config.r_buffer);
 }
 
 int main(int argc, char *argv[])
