@@ -159,7 +159,7 @@ static void destroy_buffer(void *ptr)
 
 static double client(const struct test_config *config)
 {
-    double start, end, srv_start, srv_end;
+    double start, end;
     int npeers = my.nservers;
     double exec_time;
     double srv_exec_time[npeers];
@@ -181,36 +181,28 @@ static double client(const struct test_config *config)
 
     for (int j = 0; j < niters; j++)
     {
-        MPI_Request reqs[npeers * 2];
-
-        for (int i = 0; i < npeers;)
+        for (int peer = 0; peer < npeers; peer++)
         {
-            srv_start = MPI_Wtime();
-            int peer_start = i;
-            int peer_end = i;
+            double srv_start = MPI_Wtime();
             int k;
+            MPI_Request reqs[nflight * 2];
 
             /* send/recv a batch of payload messages, 1 to each server */
-            for (k = 0; i < npeers && k < nflight; i++, k++)
+            for (k = 0; k < nflight; k++)
             {
-                MPI_CHECK(MPI_Irecv(&r_buffer[data_size * k], 0, MPI_CHAR, i,
+                MPI_CHECK(MPI_Irecv(&r_buffer[data_size * k], 0, MPI_CHAR, peer,
                                     0, MPI_COMM_WORLD, &reqs[k * 2]));
 
                 MPI_CHECK(MPI_Isend(&s_buffer[data_size * k], data_size,
-                                    MPI_CHAR, i, 0, MPI_COMM_WORLD,
+                                    MPI_CHAR, peer, 0, MPI_COMM_WORLD,
                                     &reqs[k * 2 + 1]));
-                peer_end = i;
             }
             /* Wait for all Isend/Irecv to complete */
             MPI_CHECK(MPI_Waitall(k * 2, reqs, MPI_STATUSES_IGNORE));
-            srv_end = MPI_Wtime();
+            double srv_end = MPI_Wtime();
 
-            for (int p = peer_start; p <= peer_end; p++)
-            {
-                /* Aggregate the results per server */
-                srv_exec_time[p] += (srv_end - srv_start) /
-                                    (peer_end - peer_start + 1);
-            }
+            /* Aggregate the results per server */
+            srv_exec_time[peer] += (srv_end - srv_start);
         }
     }
 
