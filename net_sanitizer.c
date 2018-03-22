@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200112L
 #endif
 
+#define _GNU_SOURCE
 #include <unistd.h>
 #include <mpi.h>
 #include <stdlib.h>
@@ -13,11 +14,12 @@
 #include <getopt.h>
 #include <libgen.h>
 #include <assert.h>
+#include <string.h>
 
 #define NITERS (1024)
 #define NFLIGHT 1
 #define MPI_ROOT_RANK 0
-
+#define HOST_MAX_SIZE 16 /* Keep it short, 16 chars max */
 
 enum output_mode
 {
@@ -40,15 +42,16 @@ struct globals
 {
     int glob_rank;
     int glob_size;
-    char hostname[256];
     int niters;
     int nflight;
     int nservers;
     int bsize;
     int nclients;
+    char hostname[HOST_MAX_SIZE];
+    char *hosts;
     enum output_mode output_mode;
 };
-#define GLOBALS_INIT { -1, -1, {0}, NITERS, NFLIGHT, 0, -1, 0, OUTPUT_MPI}
+#define GLOBALS_INIT { -1, -1, NITERS, NFLIGHT, 0, -1, 0, {0}, NULL, OUTPUT_MPI}
 static struct globals my = GLOBALS_INIT;
 
 struct results
@@ -70,7 +73,7 @@ struct test_config
 };
 
 #define RESULTS_PRINT_HEADER                                                   \
-    "   size(B)  time(s)  bw(MB/s) lat(us)       iops"
+    "#             src             dest size(B)    time(s)   bw(MB/s) lat(us)       iops"
 
 #define RESULTS_PRINT_FMT                                                      \
     "%7d %10.1f %10.0f %7.2f %10.0f\n"
@@ -81,6 +84,11 @@ struct test_config
     (res)->bw,                                                                 \
     (res)->latency,                                                            \
     (res)->iops
+
+static const char *get_hostname(int rank, bool is_client)
+{
+    return (my.hosts + (rank + (is_client ? my.nservers : 0)) * HOST_MAX_SIZE);
+}
 
 bool is_server(void)
 {
@@ -113,7 +121,7 @@ static void print_header_verbose(const struct test_config *config)
     if (client_rank != 0)
         return;
 
-   fprintf(stdout, "#rank peer "RESULTS_PRINT_HEADER"\n");
+   fprintf(stdout, RESULTS_PRINT_HEADER"\n");
    fflush(stdout);
 }
 
@@ -128,8 +136,9 @@ static void print_results_verbose(const struct test_config *config,
     int client_rank;
     MPI_CHECK(MPI_Comm_rank(clients_comm, &client_rank));
 
-    fprintf(stdout, " %4d %4d "RESULTS_PRINT_FMT,
-                    client_rank, dst,
+    fprintf(stdout, " %16s %16s "RESULTS_PRINT_FMT,
+                    get_hostname(client_rank, true),
+                    get_hostname(dst, false),
                     RESULTS_PRINT_ARGS(config, input_res));
     fflush(stdout);
 }
@@ -184,11 +193,10 @@ static double client(const struct test_config *config)
         for (int peer = 0; peer < npeers; peer++)
         {
             double srv_start = MPI_Wtime();
-            int k;
             MPI_Request reqs[nflight * 2];
 
             /* send/recv a batch of payload messages, 1 to each server */
-            for (k = 0; k < nflight; k++)
+            for (int k = 0; k < nflight; k++)
             {
                 MPI_CHECK(MPI_Irecv(&r_buffer[data_size * k], 0, MPI_CHAR, peer,
                                     0, MPI_COMM_WORLD, &reqs[k * 2]));
@@ -198,7 +206,7 @@ static double client(const struct test_config *config)
                                     &reqs[k * 2 + 1]));
             }
             /* Wait for all Isend/Irecv to complete */
-            MPI_CHECK(MPI_Waitall(k * 2, reqs, MPI_STATUSES_IGNORE));
+            MPI_CHECK(MPI_Waitall(nflight * 2, reqs, MPI_STATUSES_IGNORE));
             double srv_end = MPI_Wtime();
 
             /* Aggregate the results per server */
@@ -563,6 +571,31 @@ static void test_alltoall(int start_size, int end_size)
     destroy_buffer(test_config.r_buffer);
 }
 
+void exchange_hostnames(void)
+{
+    my.hosts = mallocz(my.glob_size * HOST_MAX_SIZE);
+    assert(my.hosts);
+
+    gethostname(my.hostname, HOST_MAX_SIZE);
+    my.hostname[HOST_MAX_SIZE - 1] = '\0';
+
+    if (is_server())
+    {
+        /* Append the index of HCA */
+        snprintf(my.hostname + strnlen(my.hostname, HOST_MAX_SIZE),
+                 HOST_MAX_SIZE,
+                 "-%d",
+                 (my.glob_rank % 2));
+    }
+
+    MPI_CHECK(MPI_Allgather(my.hostname,
+                            HOST_MAX_SIZE, MPI_BYTE,
+                            my.hosts, HOST_MAX_SIZE, MPI_BYTE,
+                            MPI_COMM_WORLD));
+    memcpy(my.hosts + (my.glob_rank * HOST_MAX_SIZE), my.hostname,
+           HOST_MAX_SIZE);
+}
+
 int main(int argc, char *argv[])
 {
     int start_size = 1;
@@ -570,9 +603,10 @@ int main(int argc, char *argv[])
 
     parse_args(argc, argv);
 
-    gethostname(my.hostname, 256);
     init_mpi(argc, argv, my.nservers);
     my.nclients = (my.glob_size - my.nservers);
+
+    exchange_hostnames();
 
     if (my.bsize >= 0)
         start_size = end_size = my.bsize;
@@ -589,6 +623,7 @@ int main(int argc, char *argv[])
         test_client_server(start_size, end_size);
 
     destroy_mpi();
+    free(my.hosts);
 
     return EXIT_SUCCESS;
 }
