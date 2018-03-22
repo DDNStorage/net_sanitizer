@@ -442,7 +442,7 @@ static void test_client_server(int start_size, int end_size)
     test_config.r_buffer = allocate_buffer(end_size * npeers);
 
     /* Warmup test */
-    init_test(-1, my.niters, my.nflight, end_size, &test_config);
+    init_test(-1, 2, my.nflight, end_size, &test_config);
     run_test_client_server(&test_config, NULL);
 
     for (curr_size = start_size; curr_size <= end_size; curr_size*=2)
@@ -538,7 +538,7 @@ static void test_alltoall(int start_size, int end_size)
     test_config.r_buffer = allocate_buffer(end_size * my.nflight);
 
     /* Warmup test */
-    init_test(-1, my.niters, my.nflight, end_size, &test_config);
+    init_test(-1, 2, my.nflight, end_size, &test_config);
     run_test_alltoall(&test_config);
 
     for (curr_size = start_size; curr_size <= end_size; curr_size *= 2)
