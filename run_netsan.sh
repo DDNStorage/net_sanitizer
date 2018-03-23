@@ -20,7 +20,7 @@
 #
 #
 #  Description: run_netsan.sh --servers "imesrv[2,3]"
-#               --clients "imeclient[1-4]" --servers-hcas "mlx5_0:mlx5_1"
+#               --clients "imeclient[1-4]"
 #               --niters 2000
 #
 #  This script is a wrapper for the network analysis tool
@@ -36,10 +36,10 @@ NETSAN="./net_sanitizer"
 
 SERVERS_LIST=""
 NUM_SERVERS=""
-SERVERS_HCAS_NUM="1" # 1 HCA per default
-SERVERS_HCAS=""
 CLIENTS=""
 NUM_CLIENTS=""
+CLIENTS_NRANKS="1"
+OUTPUT_FILE=""
 
 # Include
 . "$SC_DIR/common.sh"
@@ -56,18 +56,20 @@ usage()
     echo "${SC_NAME}"
     echo "    --servers <list>              List of servers."
     echo "    --servers-file <file>         File containing the server names (not implemented)."
-    echo "    --servers-hcas <HCA1[:HCA3]>  List of HCAs to use on servers."
     echo "    --clients <list>              List of clients."
     echo "    --clients-file <file>         File containing the client names (not implemented)."
     echo "    --niters <num>                Number of iterations."
     echo "    --nflight <num>               Number of infligh messages."
     echo "    --bsize <num>                 Buffer size (in byptes)."
     echo "    --verbose                     Enable verbose mode."
+    echo "    --hostnames                   Use hostname resolution for MPI ranks."
     echo "    --help                        Print this help message."
+    echo "    --output <file>               Output data file to use with gnuplot."
 }
 
-OPTS="$(getopt -o h,v -l servers:,servers-file:,servers-hcas:,niters:,\
-clients:,clients-file:,bsize:,help,nflight:,verbose -n "$0" -- "$@")"
+OPTS="$(getopt -o h,v -l servers:,servers-file:,niters:,\
+clients:,clients-file:,bsize:,help,nflight:,verbose,hostnames,output,\
+clients-nranks:, -n "$0" -- "$@")"
 eval set -- "$OPTS"
 
 while true
@@ -84,10 +86,6 @@ do
             not_implemented
             shift 2
             ;;
-        --servers-hcas)
-            SERVERS_HCAS="$2"
-            shift 2
-            ;;
         --clients)
             CLIENTS_LIST="$2"
             shift 2
@@ -100,12 +98,24 @@ do
            NETSAN_OPTS+=" --niters $2"
            shift 2
            ;;
+        --hostnames)
+           NETSAN_OPTS+=" --hostnames "
+           shift
+           ;;
         --nflight)
            NETSAN_OPTS+=" --nflight $2"
            shift 2
            ;;
         --bsize)
            NETSAN_OPTS+=" --bsize $2"
+           shift 2
+           ;;
+        --output)
+           OUTPUT_FILE="$2"
+           shift 2
+           ;;
+        --clients-nranks)
+           CLIENTS_NRANKS="$2"
            shift 2
            ;;
         -v|--verbose)
@@ -119,30 +129,28 @@ do
     esac
 done
 
-if [ -n "$SERVERS_HCAS" ]; then
-    SERVERS_HCAS_NUM=$(echo $SERVERS_HCAS | awk -F: '{print NF}')
-fi
-
-SERVERS_LIST=$(node_set "$SERVERS_LIST" ":$SERVERS_HCAS_NUM")
+SERVERS_LIST=$(node_set "$SERVERS_LIST")
 NUM_SERVERS=$(echo $SERVERS_LIST | awk -F, '{print NF}')
-MPI_NUM_SERVERS=$(($NUM_SERVERS * $SERVERS_HCAS_NUM))
 
-CLIENTS_LIST=$(node_set "$CLIENTS_LIST" "")
-NUM_CLIENTS=$(echo $CLIENTS_LIST | awk -F, '{print NF}')
+CLIENTS_LIST=$(node_set "$CLIENTS_LIST" ":$CLIENTS_NRANKS")
+NUM_CLIENTS=$(($(echo $CLIENTS_LIST | awk -F, '{print NF}') * $CLIENTS_NRANKS))
 
 COMMON_OPTS="-hosts $SERVERS_LIST,$CLIENTS_LIST"
-SERVERS_OPTS="-genv MV2_NUM_HCAS $SERVERS_HCAS_NUM -np $MPI_NUM_SERVERS"
-if [ -n "$SERVERS_HCAS" ]; then
-    SERVERS_OPTS+=" -genv MV2_IBA_HCA $SERVERS_HCAS"
-fi
-CLIENTS_OPTS="-envnone -genv MV2_NUM_HCAS 1 -np $NUM_CLIENTS"
-NETSAN_OPTS+=" --nservers $MPI_NUM_SERVERS"
+SERVERS_OPTS="-np $NUM_SERVERS"
+CLIENTS_OPTS="-np $NUM_CLIENTS -env MV2_NUM_HCAS 1"
+NETSAN_OPTS+=" --nservers $NUM_SERVERS"
 
 echo "Servers($NUM_SERVERS): $SERVERS_LIST"
 echo "Clients($NUM_CLIENTS): $CLIENTS_LIST"
 echo "Netsan args: $NETSAN_OPTS"
 echo ""
 
-$MPIEXEC $COMMON_OPTS \
-$SERVERS_OPTS $NETSAN $NETSAN_OPTS : \
-$CLIENTS_OPTS $NETSAN $NETSAN_OPTS
+if [ -n "$OUTPUT_FILE" ]; then
+    $MPIEXEC $COMMON_OPTS \
+        $SERVERS_OPTS $NETSAN $NETSAN_OPTS : \
+        $CLIENTS_OPTS $NETSAN $NETSAN_OPTS > "$OUTPUT_FILE"
+else
+    $MPIEXEC $COMMON_OPTS \
+        $SERVERS_OPTS $NETSAN $NETSAN_OPTS : \
+        $CLIENTS_OPTS $NETSAN $NETSAN_OPTS
+fi

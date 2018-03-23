@@ -16,15 +16,32 @@
 #include <assert.h>
 #include <string.h>
 
+/* Number of RDMA buffers allowed to run in parallel */
+#define NUM_RDMA_BUFFERS 256
 #define NITERS (1024)
 #define NFLIGHT 1
 #define MPI_ROOT_RANK 0
 #define HOST_MAX_SIZE 16 /* Keep it short, 16 chars max */
+#define MPI_RANK_ANY -1
 
 enum output_mode
 {
     OUTPUT_MPI,
     OUTPUT_VERBOSE,
+};
+
+enum direction
+{
+    DIR_NONE = 0,
+    DIR_PUT  = 1 << 0,
+    DIR_GET  = 1 << 1,
+};
+
+const char * direction_str[] =
+{
+    [DIR_NONE] = "Und",
+    [DIR_PUT]  = "Put",
+    [DIR_GET]  = "Get",
 };
 
 #define MPI_CHECK(func)                                                        \
@@ -47,11 +64,12 @@ struct globals
     int nservers;
     int bsize;
     int nclients;
+    bool hostname_resolve;
     char hostname[HOST_MAX_SIZE];
     char *hosts;
     enum output_mode output_mode;
 };
-#define GLOBALS_INIT { -1, -1, NITERS, NFLIGHT, 0, -1, 0, {0}, NULL, OUTPUT_MPI}
+#define GLOBALS_INIT { -1, -1, NITERS, NFLIGHT, 0, -1, 0, 0, {0}, NULL, OUTPUT_MPI}
 static struct globals my = GLOBALS_INIT;
 
 struct results
@@ -68,17 +86,37 @@ struct test_config
     int data_size;
     int niters;
     int nflight;
+    enum direction direction;
     void *s_buffer;
     void *r_buffer;
+    void *rdma_buffer;
+    MPI_Win rdma_win;
+};
+
+enum rstate
+{
+    STATE_REQ_NULL = 0,
+    STATE_REQ_POSTED,
+    STATE_RDMA_POSTED,
+    STATE_RESP_POSTED,
+};
+
+const char * rstate_str[] =
+{
+    [STATE_REQ_NULL] = "req null",
+    [STATE_REQ_POSTED] = "req posted",
+    [STATE_RDMA_POSTED] = "rdma posted",
+    [STATE_RESP_POSTED] = "resp posted",
 };
 
 #define RESULTS_PRINT_HEADER                                                   \
-    "#             src             dest size(B)    time(s)   bw(MB/s) lat(us)       iops"
+    "Dir size(B)    time(s)   bw(MB/s) lat(us)    iops"
 
 #define RESULTS_PRINT_FMT                                                      \
-    "%7d %10.1f %10.0f %7.2f %10.0f\n"
+    "%3s %7d %10.1f %10.0f %7.2f %10.0f\n"
 
 #define RESULTS_PRINT_ARGS(config, res)                                        \
+    direction_str[(config)->direction],                                        \
     (config)->data_size,                                                       \
     (res)->exec_time,                                                          \
     (res)->bw,                                                                 \
@@ -87,6 +125,12 @@ struct test_config
 
 static const char *get_hostname(int rank, bool is_client)
 {
+    static const char * rank_any = "all";
+
+    /* Treat -1 as a special value corresponding to all ranks */
+    if (rank == MPI_RANK_ANY)
+        return rank_any;
+
     return (my.hosts + (rank + (is_client ? my.nservers : 0)) * HOST_MAX_SIZE);
 }
 
@@ -113,7 +157,7 @@ static void print_header_verbose(const struct test_config *config)
 {
     int client_rank;
 
-    /* It's a warmup */
+    /* It's a warmup, nothing to print */
     if (config->curr_iter < 0)
         return;
 
@@ -121,7 +165,7 @@ static void print_header_verbose(const struct test_config *config)
     if (client_rank != 0)
         return;
 
-   fprintf(stdout, RESULTS_PRINT_HEADER"\n");
+   fprintf(stdout,"#             src             dest "RESULTS_PRINT_HEADER"\n");
    fflush(stdout);
 }
 
@@ -136,10 +180,16 @@ static void print_results_verbose(const struct test_config *config,
     int client_rank;
     MPI_CHECK(MPI_Comm_rank(clients_comm, &client_rank));
 
-    fprintf(stdout, " %16s %16s "RESULTS_PRINT_FMT,
-                    get_hostname(client_rank, true),
-                    get_hostname(dst, false),
-                    RESULTS_PRINT_ARGS(config, input_res));
+    if (!my.hostname_resolve)
+        fprintf(stdout," %16d %16d "RESULTS_PRINT_FMT,
+                        client_rank,
+                        dst,
+                        RESULTS_PRINT_ARGS(config, input_res));
+    else
+        fprintf(stdout," %16s %16s "RESULTS_PRINT_FMT,
+                        get_hostname(client_rank, true),
+                        get_hostname(dst, false),
+                        RESULTS_PRINT_ARGS(config, input_res));
     fflush(stdout);
 }
 
@@ -171,15 +221,14 @@ static double client(const struct test_config *config)
     double start, end;
     int npeers = my.nservers;
     double exec_time;
-    double srv_exec_time[npeers];
 
     const int nflight   = config->nflight;
     const int niters    = config->niters;
-    const int data_size = config->data_size;
     char *s_buffer      = config->s_buffer;
     char *r_buffer      = config->r_buffer;
 
-    memset(&srv_exec_time[0], 0, npeers * sizeof(double));
+    MPI_Request reqs[nflight * 2];
+    int k = 0;
 
     if (my.output_mode == OUTPUT_VERBOSE)
         print_header_verbose(config);
@@ -192,39 +241,41 @@ static double client(const struct test_config *config)
     {
         for (int peer = 0; peer < npeers; peer++)
         {
-            double srv_start = MPI_Wtime();
-            MPI_Request reqs[nflight * 2];
+            MPI_CHECK(MPI_Irecv(&r_buffer[k], 1,
+                                MPI_CHAR, peer,
+                                0,
+                                MPI_COMM_WORLD,
+                                &reqs[k * 2]));
 
-            /* send/recv a batch of payload messages, 1 to each server */
-            for (int k = 0; k < nflight; k++)
+            /* Send the RDMA request. The displacement to use is encoded
+             * into the MPI TAG */
+            MPI_CHECK(MPI_Isend(&s_buffer[k], 1,
+                                MPI_CHAR, peer,
+                                k, /* MPI TAG = displacement */
+                                MPI_COMM_WORLD,
+                                &reqs[k * 2 + 1]));
+
+            /* Nflight reached, now wait for all reqs to complete */
+            if (++k >= nflight)
             {
-                MPI_CHECK(MPI_Irecv(&r_buffer[data_size * k], 0, MPI_CHAR, peer,
-                                    0, MPI_COMM_WORLD, &reqs[k * 2]));
-
-                MPI_CHECK(MPI_Isend(&s_buffer[data_size * k], data_size,
-                                    MPI_CHAR, peer, 0, MPI_COMM_WORLD,
-                                    &reqs[k * 2 + 1]));
+                /* Wait for all Isend/Irecv to complete */
+                MPI_CHECK(MPI_Waitall(k * 2, reqs, MPI_STATUSES_IGNORE));
+                k = 0;
             }
-            /* Wait for all Isend/Irecv to complete */
-            MPI_CHECK(MPI_Waitall(nflight * 2, reqs, MPI_STATUSES_IGNORE));
-            double srv_end = MPI_Wtime();
-
-            /* Aggregate the results per server */
-            srv_exec_time[peer] += (srv_end - srv_start);
         }
     }
+
+    /* Wait for all Isend/Irecv to complete */
+    MPI_CHECK(MPI_Waitall(k * 2, reqs, MPI_STATUSES_IGNORE));
 
     end = MPI_Wtime();
     exec_time = (end - start);
 
     if (my.output_mode == OUTPUT_VERBOSE)
     {
-        for (int p = 0; p < npeers; p++)
-        {
-            struct results res;
-            generate_results(config, 1, srv_exec_time[p], &res);
-            print_results_verbose(config, p, &res);
-        }
+        struct results res;
+        generate_results(config, 1, exec_time, &res);
+        print_results_verbose(config, -1, &res);
     }
 
     return exec_time;
@@ -233,46 +284,140 @@ static double client(const struct test_config *config)
 static double server(const struct test_config *config)
 {
     double start, end;
-    int i;
 
-    const int niters    = config->niters;
-    const int data_size = config->data_size;
+    const int nflight   = config->nflight;
     char *s_buffer      = config->s_buffer;
     char *r_buffer      = config->r_buffer;
 
-    MPI_Request reqs[my.nclients];
-    int         cli_count[my.nclients];
+    int (*mpi_rma_func)(const void *origin_addr, int origin_count,
+                        MPI_Datatype origin_datatype, int target_rank,
+                        MPI_Aint target_disp, int target_count,
+                        MPI_Datatype target_datatype, MPI_Win win,
+                        MPI_Request *req);
 
-    memset(&cli_count, 0, sizeof(int) * my.nclients);
+    int nb_completed = 0;
+    MPI_Request reqs[nflight];
+    enum rstate rstates[nflight];
+    int dst_ranks[nflight];
+
+    /* Select which direction to use */
+    if (config->direction == DIR_PUT)
+        mpi_rma_func = MPI_Rput;
+    else if (config->direction == DIR_GET)
+        mpi_rma_func = MPI_Rput;
+    else
+        assert(0);
+
+    /* Post all receive buffers to retrieve client's requests */
+    for (int i = 0; i < nflight; i++)
+    {
+        MPI_CHECK(MPI_Irecv(&r_buffer[i],
+                            1, MPI_CHAR,
+                            MPI_ANY_SOURCE,
+                            MPI_ANY_TAG,
+                            MPI_COMM_WORLD,
+                            &reqs[i]));
+        rstates[i] = STATE_REQ_POSTED;
+        dst_ranks[i] = MPI_RANK_ANY;
+    }
+
+    MPI_Win_lock_all(0, config->rdma_win);
 
     start = MPI_Wtime();
 
-    /* Pre-post recvs for all clients */
-    for (i = 0; i < my.nclients; i++)
+retry:
+    /* Make sure we progress all the requests in a fair way */
+    for (int i = 0; i < nflight; i++)
     {
-        MPI_CHECK(MPI_Irecv(&r_buffer[data_size * i], data_size, MPI_CHAR,
-                            i + my.nservers, 0, MPI_COMM_WORLD, &reqs[i]));
-    }
-
-    for (i = 0; i < (niters * my.nclients); i++)
-    {
+        int flag;
         MPI_Status status;
-        int loc;
+        int loc = i;
 
-        MPI_CHECK(MPI_Waitany(my.nclients, reqs, &loc, &status));
-        MPI_CHECK(MPI_Send(&s_buffer[data_size * loc], 0, MPI_CHAR,
-                           status.MPI_SOURCE, 0, MPI_COMM_WORLD));
+        if (reqs[i] == MPI_REQUEST_NULL)
+            continue;
 
-        /* Last iteration for the dest MPI rank, don't need to repost recv */
-        if (++(cli_count[loc]) <= (niters - 1))
+        MPI_Test(&reqs[i], &flag, &status);
+        if (!flag)
+            continue;
+
+#if 0
+        fprintf(stderr, "Received %s from %d (loc %d)\n",
+                        rstate_str[rstates[loc]],
+                        status.MPI_SOURCE,
+                        loc);
+#endif
+
+        switch (rstates[loc])
         {
-            MPI_CHECK(MPI_Irecv(&r_buffer[data_size * loc], data_size,
-                                MPI_CHAR, status.MPI_SOURCE, 0, MPI_COMM_WORLD,
+        case STATE_REQ_POSTED:
+            dst_ranks[loc] = status.MPI_SOURCE;
+            assert(dst_ranks[loc] >= 0 && dst_ranks[loc] < my.glob_size);
+
+            void *base_ptr = (char *) config->rdma_buffer +
+                                      loc * config->data_size;
+            MPI_CHECK(mpi_rma_func(base_ptr,
+                                   config->data_size,
+                                   MPI_CHAR,
+                                   status.MPI_SOURCE,
+                                   status.MPI_TAG,
+                                   config->data_size,
+                                   MPI_CHAR,
+                                   config->rdma_win,
+                                   &reqs[loc]));
+            rstates[loc] = STATE_RDMA_POSTED;
+            break;
+
+        case STATE_RDMA_POSTED:
+            MPI_CHECK(MPI_Isend(&s_buffer[loc],
+                                1, MPI_CHAR,
+                                dst_ranks[loc],
+                                0, MPI_COMM_WORLD,
                                 &reqs[loc]));
+            rstates[loc] = STATE_RESP_POSTED;
+            break;
+
+        case STATE_RESP_POSTED:
+            nb_completed++;
+            dst_ranks[loc] = MPI_RANK_ANY;
+
+            if ((nb_completed + nflight) <=
+                my.nclients * config->niters)
+            {
+                MPI_CHECK(MPI_Irecv(&r_buffer[loc],
+                                    1, MPI_CHAR,
+                                    MPI_ANY_SOURCE,
+                                    MPI_ANY_TAG,
+                                    MPI_COMM_WORLD,
+                                    &reqs[loc]));
+                rstates[loc] = STATE_REQ_POSTED;
+            }
+            else
+            {
+                reqs[loc] = MPI_REQUEST_NULL;
+                rstates[loc] = STATE_REQ_NULL;
+
+                /* End of test reached, now leaving */
+                if (my.nclients * config->niters == nb_completed)
+                    goto exit;
+            }
+            break;
+
+        case STATE_REQ_NULL:
+        /* fallthrough */
+        default:
+            fprintf(stderr, "Wrong state %d %d\n",
+                    rstates[loc], loc);
+            assert(0);
         }
     }
 
+    /* Retry */
+    goto retry;
+
+exit:
+    MPI_Win_unlock_all(config->rdma_win);
     end = MPI_Wtime();
+
     return end - start;
 }
 
@@ -280,18 +425,24 @@ static void init_test(const int curr_iter,
                       const int niters,
                       const int nflight,
                       const int data_size,
+                      const enum direction direction,
                       struct test_config *config)
 {
     config->nflight   = nflight;
     config->niters    = niters;
     config->data_size = data_size;
+    config->direction = direction;
     config->curr_iter = curr_iter;
 }
 
-static double run_test_client_server(const struct test_config *config,
-                                   struct results *res)
+static double run_test_client_server(struct test_config *config,
+                                     struct results *res)
 {
-    /* use rank 0 -> (nservers - 1) as the "servers" */
+    /* Few barriers to sync everybody */
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
     if (is_server())
     {
         /* each server waits for niters messages from each client */
@@ -376,9 +527,9 @@ static void print_results_reduced(const struct test_config *config,
     if (split_comm_rank == MPI_ROOT_RANK)
     {
         if (config->curr_iter == 0)
-            fprintf(stderr, RESULTS_PRINT_HEADER"\n");
+            fprintf(stdout, RESULTS_PRINT_HEADER"\n");
 
-        fprintf(stderr, RESULTS_PRINT_FMT,
+        fprintf(stdout, RESULTS_PRINT_FMT,
                         RESULTS_PRINT_ARGS(config, &output_res));
     }
 }
@@ -399,12 +550,13 @@ static void parse_args(int argc, char *argv[])
         { "nflight",    required_argument, 0, 'f' },
         { "help",       no_argument,       0, 'h' },
         { "bsize",      required_argument, 0, 'b' },
+        { "hostnames",  no_argument,       0, 'n' },
         { "verbose",    no_argument,       0, 'v' },
         { 0,            0,                 0, 0 }
     };
 
     while (1) {
-        int c = getopt_long(argc, argv, "s:i:h,f:",
+        int c = getopt_long(argc, argv, "s:i:h,f:,n",
                         long_options, NULL);
         if (c == -1)
             break;
@@ -423,6 +575,9 @@ static void parse_args(int argc, char *argv[])
             case 'b':
                 my.bsize = atoi(optarg);
                 break;
+            case 'n':
+                my.hostname_resolve = true;
+                break;
             case 'h':
                 help_usage(argv[0], stdout);
                 exit(EXIT_SUCCESS);
@@ -438,39 +593,52 @@ static void parse_args(int argc, char *argv[])
     }
 }
 
-static void test_client_server(int start_size, int end_size)
+static void test_client_server(int start_size, int end_size,
+                               enum direction direction)
 {
     int curr_size;
     int curr_iter = 0;
     struct test_config test_config;
-    int npeers = my.glob_rank < my.nservers ? my.nclients : my.nservers;
+
+    int nflight = is_server() ? NUM_RDMA_BUFFERS : my.nflight;
+    const int win_size = end_size * nflight;
 
     /* Allocate buffers */
-    test_config.s_buffer = allocate_buffer(end_size * npeers);
-    test_config.r_buffer = allocate_buffer(end_size * npeers);
+    test_config.s_buffer = allocate_buffer(nflight);
+    test_config.r_buffer = allocate_buffer(nflight);
+
+    MPI_CHECK(MPI_Win_allocate(win_size,
+                               end_size, /* disp unit */
+                               MPI_INFO_NULL,
+                               MPI_COMM_WORLD,
+                               &test_config.rdma_buffer,
+                               &test_config.rdma_win));
 
     /* Warmup test */
-    init_test(-1, 2, my.nflight, end_size, &test_config);
+    init_test(-1, NUM_RDMA_BUFFERS, nflight, 1, direction, &test_config);
     run_test_client_server(&test_config, NULL);
 
-    for (curr_size = start_size; curr_size <= end_size; curr_size*=2)
+    for (curr_size = start_size; curr_size <= end_size; curr_size *= 2)
     {
         struct results res;
-        double exec_time;
+        double exec_time = 0;
 
         init_test(curr_iter++,
-                  my.niters, my.nflight, curr_size,
+                  my.niters, nflight, curr_size,
+                  direction,
                   &test_config);
 
-        MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
         exec_time = run_test_client_server(&test_config, &res);
 
         if (my.output_mode == OUTPUT_MPI)
         {
+            int npeers = my.glob_rank < my.nservers ? my.nclients : my.nservers;
             generate_results(&test_config, npeers, exec_time, &res);
             print_results_reduced(&test_config, &res);
         }
     }
+
+    MPI_CHECK(MPI_Win_free(&test_config.rdma_win));
 
     destroy_buffer(test_config.s_buffer);
     destroy_buffer(test_config.r_buffer);
@@ -494,7 +662,7 @@ static double run_test_alltoall(const struct test_config *config)
     if (my.output_mode == OUTPUT_VERBOSE)
         print_header_verbose(config);
 
-    for (distance = 1; distance < npeers; distance++)
+    for (distance = 0; distance < npeers; distance++)
     {
         int prev_rank = ((my.glob_rank - distance + npeers) % npeers);
         int next_rank = (my.glob_rank + distance) % npeers;
@@ -503,24 +671,40 @@ static double run_test_alltoall(const struct test_config *config)
         MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
         start = MPI_Wtime();
+        k = 0;
 
-        for (j = 0; j < niters;)
+        for (j = 0; j < niters; j++)
         {
-            for (k = 0; j < niters && k < nflight; j++, k++)
-            {
-                MPI_CHECK(MPI_Irecv(&r_buffer[data_size * k], data_size,
-                                    MPI_CHAR, prev_rank, 0, MPI_COMM_WORLD,
-                                    &reqs[k * 2]));
+            MPI_CHECK(MPI_Irecv(&r_buffer[data_size * k], data_size,
+                                MPI_CHAR, prev_rank, 0, MPI_COMM_WORLD,
+                                &reqs[k]));
 
-                MPI_CHECK(MPI_Isend(&s_buffer[data_size * k], data_size,
-                                   MPI_CHAR, next_rank, 0, MPI_COMM_WORLD,
-                                   &reqs[k * 2 + 1]));
+            MPI_CHECK(MPI_Isend(&s_buffer[data_size * k], data_size,
+                               MPI_CHAR, next_rank, 0, MPI_COMM_WORLD,
+                               &reqs[nflight + k]));
+
+            /* Nflight reached, now wait for all reqs to complete */
+            if (++k >= nflight)
+            {
+                int sflag = 0, rflag = 0;
+                while (sflag == 0 || rflag == 0)
+                {
+                    if (rflag == 0)
+                        MPI_CHECK(MPI_Testall(nflight, &reqs[nflight], &rflag,
+                                              MPI_STATUSES_IGNORE));
+
+                    if (sflag == 0)
+                    {
+                        MPI_CHECK(MPI_Testall(nflight, &reqs[0], &sflag,
+                                              MPI_STATUSES_IGNORE));
+                        if (sflag == 1)
+                            end = MPI_Wtime();
+                    }
+                }
+                k = 0;
             }
-            /* Wait for all Isend/Irecv to complete */
-            MPI_CHECK(MPI_Waitall(k * 2, reqs, MPI_STATUSES_IGNORE));
         }
 
-        end = MPI_Wtime();
         total_exec_time += (end - start);
 
         if (my.output_mode == OUTPUT_VERBOSE)
@@ -546,7 +730,7 @@ static void test_alltoall(int start_size, int end_size)
     test_config.r_buffer = allocate_buffer(end_size * my.nflight);
 
     /* Warmup test */
-    init_test(-1, 2, my.nflight, end_size, &test_config);
+    init_test(-1, 2, my.nflight, end_size, DIR_NONE, &test_config);
     run_test_alltoall(&test_config);
 
     for (curr_size = start_size; curr_size <= end_size; curr_size *= 2)
@@ -556,6 +740,7 @@ static void test_alltoall(int start_size, int end_size)
 
         init_test(curr_iter++,
                   my.niters, my.nflight, curr_size,
+                  DIR_NONE,
                   &test_config);
 
         exec_time = run_test_alltoall(&test_config);
@@ -579,14 +764,18 @@ void exchange_hostnames(void)
     gethostname(my.hostname, HOST_MAX_SIZE);
     my.hostname[HOST_MAX_SIZE - 1] = '\0';
 
+    int local_rank;
+
     if (is_server())
-    {
-        /* Append the index of HCA */
-        snprintf(my.hostname + strnlen(my.hostname, HOST_MAX_SIZE),
-                 HOST_MAX_SIZE,
-                 "-%d",
-                 (my.glob_rank % 2));
-    }
+        local_rank = my.glob_rank;
+    else
+        MPI_CHECK(MPI_Comm_rank(clients_comm, &local_rank));
+
+    /* Append the global rank  */
+    snprintf(my.hostname + strnlen(my.hostname, HOST_MAX_SIZE),
+             HOST_MAX_SIZE,
+             "-%d",
+             local_rank);
 
     MPI_CHECK(MPI_Allgather(my.hostname,
                             HOST_MAX_SIZE, MPI_BYTE,
@@ -606,13 +795,14 @@ int main(int argc, char *argv[])
     init_mpi(argc, argv, my.nservers);
     my.nclients = (my.glob_size - my.nservers);
 
-    exchange_hostnames();
+    if (my.hostname_resolve)
+        exchange_hostnames();
 
     if (my.bsize >= 0)
         start_size = end_size = my.bsize;
 
     if (my.glob_rank == 0)
-        fprintf(stderr, "nservers=%i nclients=%d niters=%d nflight=%d "
+        fprintf(stdout, "#nservers=%i nclients=%d niters=%d nflight=%d "
                         "ssize=%d, esize=%d\n",
                         my.nservers, my.nclients, my.niters, my.nflight,
                         start_size, end_size);
@@ -620,10 +810,16 @@ int main(int argc, char *argv[])
     if (my.nservers <= 0)
         test_alltoall(start_size, end_size);
     else
-        test_client_server(start_size, end_size);
+    {
+        test_client_server(start_size, end_size, DIR_PUT);
+
+        test_client_server(start_size, end_size, DIR_GET);
+    }
 
     destroy_mpi();
-    free(my.hosts);
+
+    if (my.hostname_resolve)
+        free(my.hosts);
 
     return EXIT_SUCCESS;
 }
