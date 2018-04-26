@@ -507,6 +507,9 @@ static void destroy_mpi(void)
         MPI_CHECK(MPI_Comm_free(&clients_comm));
         clients_comm = MPI_COMM_NULL;
     }
+
+    MPI_CHECK(MPI_Op_free(&results_op_sum));
+    MPI_CHECK(MPI_Type_free(&results_dtype));
     MPI_CHECK(MPI_Finalize());
 }
 
