@@ -39,6 +39,7 @@ NUM_SERVERS=""
 CLIENTS=""
 NUM_CLIENTS=""
 CLIENTS_NRANKS="1"
+SERVERS_NRANKS="1"
 OUTPUT_FILE=""
 
 # Include
@@ -56,8 +57,10 @@ usage()
     echo "${SC_NAME}"
     echo "    --servers <list>              List of servers."
     echo "    --servers-file <file>         File containing the server names (not implemented)."
+    echo "    --servers-nranks <num>        Number of MPI ranks per server."
     echo "    --clients <list>              List of clients."
     echo "    --clients-file <file>         File containing the client names (not implemented)."
+    echo "    --clients-nranks <num>        Number of MPI ranks per client."
     echo "    --niters <num>                Number of iterations."
     echo "    --nflight <num>               Number of infligh messages."
     echo "    --bsize <num>                 Buffer size (in byptes)."
@@ -69,7 +72,7 @@ usage()
 
 OPTS="$(getopt -o h,v -l servers:,servers-file:,niters:,\
 clients:,clients-file:,bsize:,help,nflight:,verbose,hostnames,output,\
-clients-nranks:, -n "$0" -- "$@")"
+clients-nranks:,servers-nranks: -n "$0" -- "$@")"
 eval set -- "$OPTS"
 
 while true
@@ -118,6 +121,10 @@ do
            CLIENTS_NRANKS="$2"
            shift 2
            ;;
+        --servers-nranks)
+           SERVERS_NRANKS="$2"
+           shift 2
+           ;;
         -v|--verbose)
            NETSAN_OPTS+=" --verbose"
            shift
@@ -129,8 +136,8 @@ do
     esac
 done
 
-SERVERS_LIST=$(node_set "$SERVERS_LIST")
-NUM_SERVERS=$(echo $SERVERS_LIST | awk -F, '{print NF}')
+SERVERS_LIST=$(node_set "$SERVERS_LIST" ":$SERVERS_NRANKS")
+NUM_SERVERS=$(($(echo $SERVERS_LIST | awk -F, '{print NF}')  * $SERVERS_NRANKS))
 
 CLIENTS_LIST=$(node_set "$CLIENTS_LIST" ":$CLIENTS_NRANKS")
 NUM_CLIENTS=$(($(echo $CLIENTS_LIST | awk -F, '{print NF}') * $CLIENTS_NRANKS))

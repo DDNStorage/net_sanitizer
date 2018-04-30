@@ -24,6 +24,8 @@
 #define HOST_MAX_SIZE 16 /* Keep it short, 16 chars max */
 #define MPI_RANK_ANY -1
 
+#define MIN(a,b) (((a)<(b))?(a):(b))
+
 enum output_mode
 {
     OUTPUT_MPI,
@@ -93,18 +95,19 @@ struct test_config
     MPI_Win rdma_win;
 };
 
+/* State machine for client/server mode */
 enum rstate
 {
-    STATE_REQ_NULL = 0,
-    STATE_REQ_POSTED,
-    STATE_RDMA_POSTED,
-    STATE_RESP_POSTED,
+    STATE_REQ_NULL = 0, /* Null request */
+    STATE_REQ_POSTED,   /* Request posted */
+    STATE_RDMA_POSTED,  /* RDMA posted */
+    STATE_RESP_POSTED,  /* Response posted */
 };
 
 const char * rstate_str[] =
 {
-    [STATE_REQ_NULL] = "req null",
-    [STATE_REQ_POSTED] = "req posted",
+    [STATE_REQ_NULL]    = "req null",
+    [STATE_REQ_POSTED]  = "req posted",
     [STATE_RDMA_POSTED] = "rdma posted",
     [STATE_RESP_POSTED] = "resp posted",
 };
@@ -127,11 +130,12 @@ static const char *get_hostname(int rank, bool is_client)
 {
     static const char * rank_any = "all";
 
-    /* Treat -1 as a special value corresponding to all ranks */
+    /* Treat MPI_RANK_ANY as a special value corresponding to all ranks */
     if (rank == MPI_RANK_ANY)
         return rank_any;
 
-    return (my.hosts + (rank + (is_client ? my.nservers : 0)) * HOST_MAX_SIZE);
+    return (my.hosts +
+            (rank + (is_client ? my.nservers : 0)) * HOST_MAX_SIZE);
 }
 
 bool is_server(void)
@@ -207,7 +211,6 @@ static void* allocate_buffer(const size_t size)
 {
     void *ptr =  mallocz(size);
     assert(ptr);
-
     return ptr;
 }
 
@@ -265,7 +268,6 @@ static double client(const struct test_config *config)
         }
     }
 
-    /* Wait for all Isend/Irecv to complete */
     MPI_CHECK(MPI_Waitall(k * 2, reqs, MPI_STATUSES_IGNORE));
 
     end = MPI_Wtime();
@@ -295,11 +297,6 @@ static double server(const struct test_config *config)
                         MPI_Datatype target_datatype, MPI_Win win,
                         MPI_Request *req);
 
-    int nb_completed = 0;
-    MPI_Request reqs[nflight];
-    enum rstate rstates[nflight];
-    int dst_ranks[nflight];
-
     /* Select which direction to use */
     if (config->direction == DIR_PUT)
         mpi_rma_func = MPI_Rput;
@@ -308,8 +305,15 @@ static double server(const struct test_config *config)
     else
         assert(0);
 
+    int nb_completed = 0;
+    MPI_Request reqs[nflight];
+    enum rstate rstates[nflight];
+    int dst_ranks[nflight];
+    /* expected number of client requests */
+    const int exp_cli_reqs = my.nclients * config->niters;
+
     /* Post all receive buffers to retrieve client's requests */
-    for (int i = 0; i < nflight; i++)
+    for (int i = 0; i < MIN(nflight, exp_cli_reqs); i++)
     {
         MPI_CHECK(MPI_Irecv(&r_buffer[i],
                             1, MPI_CHAR,
@@ -327,11 +331,10 @@ static double server(const struct test_config *config)
 
 retry:
     /* Make sure we progress all the requests in a fair way */
-    for (int i = 0; i < nflight; i++)
+    for (int i = 0; i < MIN(nflight, exp_cli_reqs); i++)
     {
         int flag;
         MPI_Status status;
-        int loc = i;
 
         if (reqs[i] == MPI_REQUEST_NULL)
             continue;
@@ -340,61 +343,58 @@ retry:
         if (!flag)
             continue;
 
-#if 0
-        fprintf(stderr, "Received %s from %d (loc %d)\n",
-                        rstate_str[rstates[loc]],
-                        status.MPI_SOURCE,
-                        loc);
-#endif
-
-        switch (rstates[loc])
+        switch (rstates[i])
         {
         case STATE_REQ_POSTED:
-            dst_ranks[loc] = status.MPI_SOURCE;
-            assert(dst_ranks[loc] >= 0 && dst_ranks[loc] < my.glob_size);
+            dst_ranks[i] = status.MPI_SOURCE;
+            assert(dst_ranks[i] >= 0 &&
+                   dst_ranks[i] < my.glob_size);
 
+            /* Start RMA operation */
             void *base_ptr = (char *) config->rdma_buffer +
-                                      loc * config->data_size;
+                                      i * config->data_size;
             MPI_CHECK(mpi_rma_func(base_ptr,
                                    config->data_size,
                                    MPI_CHAR,
-                                   status.MPI_SOURCE,
-                                   status.MPI_TAG,
+                                   status.MPI_SOURCE /* Rank of receiver */,
+                                   status.MPI_TAG /* Disp at receiver side */,
                                    config->data_size,
                                    MPI_CHAR,
                                    config->rdma_win,
-                                   &reqs[loc]));
-            rstates[loc] = STATE_RDMA_POSTED;
+                                   &reqs[i]));
+            rstates[i] = STATE_RDMA_POSTED;
             break;
 
         case STATE_RDMA_POSTED:
-            MPI_CHECK(MPI_Isend(&s_buffer[loc],
+            /* RMA completed, now send the response */
+            MPI_CHECK(MPI_Isend(&s_buffer[i],
                                 1, MPI_CHAR,
-                                dst_ranks[loc],
+                                dst_ranks[i],
                                 0, MPI_COMM_WORLD,
-                                &reqs[loc]));
-            rstates[loc] = STATE_RESP_POSTED;
+                                &reqs[i]));
+            rstates[i] = STATE_RESP_POSTED;
             break;
 
         case STATE_RESP_POSTED:
+            /* Response sent, now repost the recv buffer */
             nb_completed++;
-            dst_ranks[loc] = MPI_RANK_ANY;
+            dst_ranks[i] = MPI_RANK_ANY;
 
             if ((nb_completed + nflight) <=
                 my.nclients * config->niters)
             {
-                MPI_CHECK(MPI_Irecv(&r_buffer[loc],
+                MPI_CHECK(MPI_Irecv(&r_buffer[i],
                                     1, MPI_CHAR,
                                     MPI_ANY_SOURCE,
                                     MPI_ANY_TAG,
                                     MPI_COMM_WORLD,
-                                    &reqs[loc]));
-                rstates[loc] = STATE_REQ_POSTED;
+                                    &reqs[i]));
+                rstates[i] = STATE_REQ_POSTED;
             }
             else
             {
-                reqs[loc] = MPI_REQUEST_NULL;
-                rstates[loc] = STATE_REQ_NULL;
+                reqs[i] = MPI_REQUEST_NULL;
+                rstates[i] = STATE_REQ_NULL;
 
                 /* End of test reached, now leaving */
                 if (my.nclients * config->niters == nb_completed)
@@ -406,7 +406,7 @@ retry:
         /* fallthrough */
         default:
             fprintf(stderr, "Wrong state %d %d\n",
-                    rstates[loc], loc);
+                    rstates[i], i);
             assert(0);
         }
     }
@@ -695,6 +695,7 @@ static double run_test_alltoall(const struct test_config *config)
                     if (rflag == 0)
                         MPI_CHECK(MPI_Testall(nflight, &reqs[nflight], &rflag,
                                               MPI_STATUSES_IGNORE));
+                    /* TODO: Register + report receive time */
 
                     if (sflag == 0)
                     {
@@ -798,6 +799,7 @@ int main(int argc, char *argv[])
     init_mpi(argc, argv, my.nservers);
     my.nclients = (my.glob_size - my.nservers);
 
+    /* Exchange hostnames if requested */
     if (my.hostname_resolve)
         exchange_hostnames();
 
@@ -815,14 +817,16 @@ int main(int argc, char *argv[])
     else
     {
         test_client_server(start_size, end_size, DIR_PUT);
-
         test_client_server(start_size, end_size, DIR_GET);
     }
 
     destroy_mpi();
 
-    if (my.hostname_resolve)
+    if (my.hosts)
+    {
         free(my.hosts);
+        my.hosts = NULL;
+    }
 
     return EXIT_SUCCESS;
 }
