@@ -2,8 +2,30 @@
 
 ## Description
 
-The network Sanitizer is a powerful tool used to find common network network
-issues in a HPC cluster.
+The Network Sanitizer is a powerful tool used to find common network network
+issues in a HPC cluster:
+
+- Network congestion: some clients might complete after the others
+  E.g., Fat-tree topology where there are more down-links than up-links.
+
+- Bad cables: might cause errors or slowdowns to the application
+
+- Misconfigured network adapter:
+  - bad firmware version
+  - wrong link speed
+
+- Network routing issues / Subnet Manager configuration:
+  E.g., how to connect some servers to a fat-tree topology to avoid network
+  congestion?
+
+- PCIe congestion, causing network performance drops
+
+- IP addressing/routing issues
+
+- IP address conflicts
+
+- Multirail routing rules not correctly applied
+
 
 The tool allows 2 different modes:
 
@@ -23,13 +45,15 @@ The tool allows 2 different modes:
 run_netsan.sh
     --servers <list>              List of servers.
     --servers-file <file>         File containing the server names (not implemented).
-    --servers-hcas <HCA1[:HCA3]>  List of HCAs to use on servers.
+    --servers-nranks <num>        Number of MPI ranks per server.
     --clients <list>              List of clients.
     --clients-file <file>         File containing the client names (not implemented).
+    --clients-nranks <num>        Number of MPI ranks per client.
     --niters <num>                Number of iterations.
-    --nflight <num>               Number of inflight messages.
+    --nflight <num>               Number of infligh messages.
     --bsize <num>                 Buffer size (in byptes).
     --verbose                     Enable verbose mode.
+    --hostnames                   Use hostname resolution for MPI ranks.
     --help                        Print this help message.
 ```
 
@@ -40,39 +64,67 @@ The list of clients/servers can be specified using the following syntax:
 
 ## Examples
 
-- Run a client/server benchmark with Multirail enabled on server side (name
-of HCAs can be determined using `ibstat` command line tool):
+- Run a client/server benchmark with 2 servers (2x IB FDR HCAs per server)
+and 4 clients (1x IB FDR HCA per client). Because each server is dual-rail,
+we need at least 2 MPI ranks per server to get the full bandwidth.
 
 ```
-run_netsan.sh --servers "server[2-3]" --clients "client[1-48]" --servers-hcas "mlx5_0:mlx5_1"
+run_netsan.sh --servers "server[2-3]" --clients "client[1-4]" \
+--servers-nranks 2
 
 Servers(2): server2:2,server3:2
-Clients(8): client1,client2,client3,client4,client5,client6,client7,client8
+Clients(8): client1,client2,client3,client4
 
-   size(B)  time(s)  bw(MB/s) lat(us)       iops
-      1        0.1          2    2.74    2335828
-      2        0.1          5    2.50    2555396
-      4        0.1         10    2.50    2558952
-      8        0.1         19    2.51    2550935
-     16        0.1         38    2.54    2517640
-     32        0.1         77    2.54    2518297
-     64        0.1        139    2.82    2271600
-    128        0.1        274    2.85    2246773
-    256        0.1        533    2.93    2183926
-    512        0.1       1029    3.04    2108186
-   1024        0.1       1878    3.33    1922853
-   2048        0.1       3423    3.65    1752542
-   4096        0.2       5642    4.43    1444395
-   8192        0.6       3506   14.26     448810
-  16384        0.7       5786   17.28     370324
-  32768        0.8      10498   19.07     335937
-  65536        1.0      15662   25.58     250595
- 131072        1.7      19547   40.99     156380
- 262144        3.0      21723   73.72      86893
- 524288        5.9      22219  144.05      44438
-1048576       11.3      23103  277.04      23103
-2097152       22.8      23022  556.00      11511
-4194304       45.5      23059 1110.18       5765
+#nservers=4 nclients=4 niters=1024 nflight=1 ssize=1, esize=4194304
+Dir size(B)    time(s)   bw(MB/s) lat(us)    iops
+Put       1        1.5          0   36.40      43955
+Put       2        1.5          0   35.46      45124
+Put       4        1.5          0   35.72      44788
+Put       8        1.4          0   35.11      45573
+Put      16        1.4          1   34.66      46157
+Put      32        1.4          1   34.96      45765
+Put      64        1.4          3   35.09      45599
+Put     128        1.4          6   34.85      45911
+Put     256        1.4         11   35.24      45407
+Put     512        1.5         22   35.47      45103
+Put    1024        1.4         45   35.10      45582
+Put    2048        1.4         89   35.31      45315
+Put    4096        1.4        179   34.99      45724
+Put    8192        1.4        354   35.27      45361
+Put   16384        1.5        685   36.48      43861
+Put   32768        1.4       1419   35.24      45403
+Put   65536        1.4       2837   35.25      45393
+Put  131072        1.4       5688   35.16      45503
+Put  262144        1.8       9135   43.79      36539
+Put  524288        2.7      11996   66.69      23993
+Put 1048576        3.4      19384   82.54      19384
+Put 2097152        6.1      21452  149.17      10726
+Put 4194304       12.0      21770  293.98       5443
+
+Dir size(B)    time(s)   bw(MB/s) lat(us)    iops
+Get       1        1.4          0   35.19      45461
+Get       2        1.4          0   35.10      45584
+Get       4        1.4          0   35.33      45291
+Get       8        1.4          0   35.20      45454
+Get      16        1.5          1   35.54      45015
+Get      32        1.5          1   37.12      43108
+Get      64        1.5          3   36.23      44161
+Get     128        1.5          5   36.07      44356
+Get     256        1.5         11   36.21      44183
+Get     512        1.5         22   35.53      45034
+Get    1024        1.4         45   35.04      45659
+Get    2048        1.4         89   34.99      45725
+Get    4096        1.4        179   34.90      45841
+Get    8192        1.5        353   35.45      45134
+Get   16384        1.4        710   35.21      45437
+Get   32768        1.4       1415   35.34      45273
+Get   65536        1.5       2768   36.13      44282
+Get  131072        1.5       5609   35.66      44869
+Get  262144        1.9       8757   45.68      35030
+Get  524288        2.6      12401   64.51      24803
+Get 1048576        3.4      19492   82.08      19492
+Get 2097152        6.1      21508  148.78      10754
+Get 4194304       12.0      21874  292.59       5468
 ```
 
 - Run a all-to-all benchmark:
