@@ -40,7 +40,8 @@ CLIENTS=""
 NUM_CLIENTS=""
 CLIENTS_NRANKS="1"
 SERVERS_NRANKS="1"
-OUTPUT_FILE=""
+SERVERS_ARGS=""
+CLIENTS_ARGS=""
 
 # Include
 . "$SC_DIR/common.sh"
@@ -58,9 +59,11 @@ usage()
     echo "    --servers <list>              List of servers."
     echo "    --servers-file <file>         File containing the server names (not implemented)."
     echo "    --servers-nranks <num>        Number of MPI ranks per server."
+    echo "    --servers-args <args>         Extra mpirun args for servers."
     echo "    --clients <list>              List of clients."
     echo "    --clients-file <file>         File containing the client names (not implemented)."
     echo "    --clients-nranks <num>        Number of MPI ranks per client."
+    echo "    --clients-args <args>         Extra mpirun args for clients."
     echo "    --niters <num>                Number of iterations."
     echo "    --nflight <num>               Number of infligh messages."
     echo "    --bsize <num>                 Buffer size (in byptes)."
@@ -71,8 +74,8 @@ usage()
 }
 
 OPTS="$(getopt -o h,v -l servers:,servers-file:,niters:,\
-clients:,clients-file:,bsize:,help,nflight:,verbose,hostnames,output,\
-clients-nranks:,servers-nranks: -n "$0" -- "$@")"
+clients:,clients-file:,bsize:,help,nflight:,verbose,hostnames,\
+clients-nranks:,servers-nranks:,clients-args:,servers-args: -n "$0" -- "$@")"
 eval set -- "$OPTS"
 
 while true
@@ -89,6 +92,14 @@ do
             not_implemented
             shift 2
             ;;
+        --servers-nranks)
+            SERVERS_NRANKS="$2"
+            shift 2
+            ;;
+        --servers-args)
+            SERVERS_ARGS="$2"
+            shift 2
+            ;;
         --clients)
             CLIENTS_LIST="$2"
             shift 2
@@ -97,6 +108,14 @@ do
             not_implemented
             shift 2
             ;;
+        --clients-nranks)
+           CLIENTS_NRANKS="$2"
+           shift 2
+           ;;
+        --clients-args)
+           CLIENTS_ARGS="$2"
+           shift 2
+           ;;
         --niters)
            NETSAN_OPTS+=" --niters $2"
            shift 2
@@ -111,18 +130,6 @@ do
            ;;
         --bsize)
            NETSAN_OPTS+=" --bsize $2"
-           shift 2
-           ;;
-        --output)
-           OUTPUT_FILE="$2"
-           shift 2
-           ;;
-        --clients-nranks)
-           CLIENTS_NRANKS="$2"
-           shift 2
-           ;;
-        --servers-nranks)
-           SERVERS_NRANKS="$2"
            shift 2
            ;;
         -v|--verbose)
@@ -143,21 +150,16 @@ CLIENTS_LIST=$(node_set "$CLIENTS_LIST" ":$CLIENTS_NRANKS")
 NUM_CLIENTS=$(($(echo $CLIENTS_LIST | awk -F, '{print NF}') * $CLIENTS_NRANKS))
 
 COMMON_OPTS="-hosts $SERVERS_LIST,$CLIENTS_LIST"
-SERVERS_OPTS="-np $NUM_SERVERS"
-CLIENTS_OPTS="-np $NUM_CLIENTS -env MV2_NUM_HCAS 1"
+SERVERS_OPTS="-np $NUM_SERVERS $SERVERS_ARGS"
+CLIENTS_OPTS="-np $NUM_CLIENTS $CLIENTS_ARGS"
 NETSAN_OPTS+=" --nservers $NUM_SERVERS"
 
 echo "Servers($NUM_SERVERS): $SERVERS_LIST"
 echo "Clients($NUM_CLIENTS): $CLIENTS_LIST"
 echo "Netsan args: $NETSAN_OPTS"
+CMD="$MPIEXEC $COMMON_OPTS \
+$SERVERS_OPTS $NETSAN $NETSAN_OPTS : \
+$CLIENTS_OPTS $NETSAN $NETSAN_OPTS"
+echo "Command line: $CMD"
 echo ""
-
-if [ -n "$OUTPUT_FILE" ]; then
-    $MPIEXEC $COMMON_OPTS \
-        $SERVERS_OPTS $NETSAN $NETSAN_OPTS : \
-        $CLIENTS_OPTS $NETSAN $NETSAN_OPTS > "$OUTPUT_FILE"
-else
-    $MPIEXEC $COMMON_OPTS \
-        $SERVERS_OPTS $NETSAN $NETSAN_OPTS : \
-        $CLIENTS_OPTS $NETSAN $NETSAN_OPTS
-fi
+eval $CMD

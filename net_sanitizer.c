@@ -17,11 +17,11 @@
 #include <string.h>
 
 /* Number of RDMA buffers allowed to run in parallel */
-#define NUM_RDMA_BUFFERS 256
-#define NITERS (1024)
-#define NFLIGHT 1
+#define NUM_RDMA_BUFFERS 128
+#define NITERS (128)
+#define NFLIGHT 12
 #define MPI_ROOT_RANK 0
-#define HOST_MAX_SIZE 16 /* Keep it short, 16 chars max */
+#define HOST_MAX_SIZE 16 /* Keep it short */
 #define MPI_RANK_ANY -1
 
 #define MIN(a,b) (((a)<(b))?(a):(b))
@@ -197,7 +197,7 @@ static void print_results_verbose(const struct test_config *config,
     fflush(stdout);
 }
 
-static void *mallocz(const int size)
+static void *mallocz(const size_t size)
 {
     void *p = NULL;
 
@@ -276,7 +276,7 @@ static double client(const struct test_config *config)
     if (my.output_mode == OUTPUT_VERBOSE)
     {
         struct results res;
-        generate_results(config, 1, exec_time, &res);
+        generate_results(config, npeers, exec_time, &res);
         print_results_verbose(config, -1, &res);
     }
 
@@ -287,7 +287,6 @@ static double server(const struct test_config *config)
 {
     double start, end;
 
-    const int nflight   = config->nflight;
     char *s_buffer      = config->s_buffer;
     char *r_buffer      = config->r_buffer;
 
@@ -305,15 +304,14 @@ static double server(const struct test_config *config)
     else
         assert(0);
 
-    int nb_completed = 0;
+    size_t nb_completed = 0;
+    const int nflight = MIN(NUM_RDMA_BUFFERS, (my.nclients * config->niters));
     MPI_Request reqs[nflight];
     enum rstate rstates[nflight];
     int dst_ranks[nflight];
-    /* expected number of client requests */
-    const int exp_cli_reqs = my.nclients * config->niters;
 
     /* Post all receive buffers to retrieve client's requests */
-    for (int i = 0; i < MIN(nflight, exp_cli_reqs); i++)
+    for (int i = 0; i < nflight; i++)
     {
         MPI_CHECK(MPI_Irecv(&r_buffer[i],
                             1, MPI_CHAR,
@@ -331,13 +329,16 @@ static double server(const struct test_config *config)
 
 retry:
     /* Make sure we progress all the requests in a fair way */
-    for (int i = 0; i < MIN(nflight, exp_cli_reqs); i++)
+    for (int i = 0; i < nflight; i++)
     {
         int flag;
         MPI_Status status;
 
         if (reqs[i] == MPI_REQUEST_NULL)
+        {
+            assert(rstates[i] == STATE_REQ_NULL);
             continue;
+        }
 
         MPI_Test(&reqs[i], &flag, &status);
         if (!flag)
@@ -366,6 +367,8 @@ retry:
             break;
 
         case STATE_RDMA_POSTED:
+            assert(dst_ranks[i] >= 0 &&
+                   dst_ranks[i] < my.glob_size);
             /* RMA completed, now send the response */
             MPI_CHECK(MPI_Isend(&s_buffer[i],
                                 1, MPI_CHAR,
@@ -412,6 +415,7 @@ retry:
     }
 
     /* Retry */
+//    MPI_CHECK(MPI_Win_flush_all(config->rdma_win));
     goto retry;
 
 exit:
@@ -665,7 +669,7 @@ static double run_test_alltoall(const struct test_config *config)
     if (my.output_mode == OUTPUT_VERBOSE)
         print_header_verbose(config);
 
-    for (distance = 0; distance < npeers; distance++)
+    for (distance = 1; distance < npeers; distance++)
     {
         int prev_rank = ((my.glob_rank - distance + npeers) % npeers);
         int next_rank = (my.glob_rank + distance) % npeers;
@@ -686,20 +690,23 @@ static double run_test_alltoall(const struct test_config *config)
                                MPI_CHAR, next_rank, 0, MPI_COMM_WORLD,
                                &reqs[nflight + k]));
 
-            /* Nflight reached, now wait for all reqs to complete */
-            if (++k >= nflight)
+            /* Nflight reached or last iteration, now wait for all reqs to
+             * complete */
+            if (++k >= nflight || (j == niters - 1))
             {
                 int sflag = 0, rflag = 0;
                 while (sflag == 0 || rflag == 0)
                 {
                     if (rflag == 0)
-                        MPI_CHECK(MPI_Testall(nflight, &reqs[nflight], &rflag,
+                    {
+                        MPI_CHECK(MPI_Testall(k, &reqs[nflight], &rflag,
                                               MPI_STATUSES_IGNORE));
+                    }
                     /* TODO: Register + report receive time */
 
                     if (sflag == 0)
                     {
-                        MPI_CHECK(MPI_Testall(nflight, &reqs[0], &sflag,
+                        MPI_CHECK(MPI_Testall(k, &reqs[0], &sflag,
                                               MPI_STATUSES_IGNORE));
                         if (sflag == 1)
                             end = MPI_Wtime();
@@ -751,7 +758,9 @@ static void test_alltoall(int start_size, int end_size)
 
         if (my.output_mode == OUTPUT_MPI)
         {
-            generate_results(&test_config, npeers, exec_time, &res);
+            generate_results(&test_config,
+                             npeers,
+                             exec_time, &res);
             print_results_reduced(&test_config, &res);
         }
     }
