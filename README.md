@@ -32,6 +32,16 @@ The Network Sanitizer requires an MPI 3.x compatible runtime to be installed
 on all the nodes where the tool will be run. The tool has been successfully
 tested with MVAPICH2.2 with multiple rail configuration enabled.
 
+## Installation
+
+Make sure `mpicc` is available in your `PATH` and type `make`:
+
+```
+$ make
+mpicc -Wall -Werror -std=c11 -g -c net_sanitizer.c
+mpicc net_sanitizer.o -o net_sanitizer
+```
+
 ## Supported modes
 
 The tool allows 2 different modes: client/server and all-to-all modes
