@@ -70,7 +70,6 @@ usage()
     echo "    --verbose                     Enable verbose mode."
     echo "    --hostnames                   Use hostname resolution for MPI ranks."
     echo "    --help                        Print this help message."
-    echo "    --output <file>               Output data file to use with gnuplot."
 }
 
 OPTS="$(getopt -o h,v -l servers:,servers-file:,niters:,\

@@ -34,14 +34,16 @@ tested with MVAPICH2.2 with multiple rail configuration enabled.
 
 ## Supported modes
 
-The tool allows 2 different modes:
+The tool allows 2 different modes: client/server and all-to-all modes
 
-- *Client/server*: in this mode, the clients directly communicate with the
-  servers. In other terms, there is no server-to-server nor client-to-client
-  communication. In this mode, every server allocates an MPI RMA Window of
-  `128 x buffer_size`, where `128` represents the maximum inflight requests a
-  server can handle. In detail, the communication pattern mimics an RPC
-  protocol, which is implemented that way:
+### Client/server ###
+
+*Client/server*: in this mode, the clients directly communicate with the
+servers. In other terms, there is no server-to-server nor client-to-client
+communication. In this mode, every server allocates an MPI RMA Window of
+`128 x buffer_size`, where `128` represents the maximum inflight requests a
+server can handle. In detail, the communication pattern mimics an RPC
+protocol, which is implemented that way:
 
 ```
                 Client                              Server
@@ -64,20 +66,37 @@ The tool allows 2 different modes:
                   |                                   |
                   v                                   v
 ```
-  This mode *does support* multiple rail configurations with MVAPICH runtime.
-  If your servers support multiple rail configurations, you should set the
-  argument `--servers-nranks=` to match the number of HCAs on your servers.
-  MVAPICH will assign HCAs to the MPI ranks in a round-robin manner, where
-  the first HCA will be assigned to the first MPI rank created local MPI
-  rank, the second HCA to the second MPI rank and so on and so forth.
-  For more information about multiple rail configurations with MVAPICH, you can
-  refer to the chapters 6.12 and 6.13 of the [MVAPICH2 documentation](http://mvapich.cse.ohio-state.edu/static/media/mvapich/mvapich2-2.2-userguide.pdf)
+This mode *does support* multiple rail configurations with MVAPICH runtime.
+If your servers support multiple rail configurations, you should set the
+argument `--servers-nranks=` to match the number of HCAs on your servers.
+MVAPICH will assign HCAs to the MPI ranks in a round-robin manner, where
+the first HCA will be assigned to the first MPI rank created local MPI
+rank, the second HCA to the second MPI rank and so on and so forth.
+For more information about multiple rail configurations with MVAPICH, you can
+refer to the chapters 6.12 and 6.13 of the [MVAPICH2 documentation](http://mvapich.cse.ohio-state.edu/static/media/mvapich/mvapich2-2.2-userguide.pdf)
 
-- *All-to-all*: in this mode, all the nodes take part of a all-to-all
-  communication pattern. To avoid a heavy saturation of the network, each
-  benchmark iteration is divided in rounds where the compute nodes communicate
-  in pairs. After all the rounds have been executed, all compute nodes have
-  communicated all-together.
+### All-to-all ###
+
+*All-to-all*: in this mode, all the nodes take part of a all-to-all
+communication pattern. To avoid a heavy saturation of the network, each
+benchmark iteration is divided in rounds where the compute nodes communicate
+in pairs. After all the rounds have been executed, all compute nodes have
+communicated all-together.
+If the nodes are homogeneous in terms of network configuration and all are
+equipped with multiple HCAs (or multiple ports) MVAPICH automatically enables
+multirail support. Multirail configuration can then be tweaked using the
+following environment variables (see [MVAPICH2 documentation](http://mvapich.cse.ohio-state.edu/static/media/mvapich/mvapich2-2.2-userguide.pdf)
+chapters 6.12 and 6.13 to get more details):
+
+- `MV2_NUM_PORTS=<number>`: Number of ports to use per MPI rank
+
+- `MV2_NUM_HCAS=<number>`: Number of HCAs to use per MPI rank
+
+- `MV2_IBA_HCA=<hca1[,hcas2]>`: List of HCAs to use per MPI rank
+
+These extra environment variables can be passed to the Network Sanitizer using
+`--client-args=<string>` and `--server-args=<string>` arguments. For example:
+`./run_netsan.sh --clients-args="-env MV2_NUM_HCAS=1"`
 
 ## Help message
 
@@ -86,9 +105,11 @@ run_netsan.sh
     --servers <list>              List of servers.
     --servers-file <file>         File containing the server names (not implemented).
     --servers-nranks <num>        Number of MPI ranks per server.
+    --servers-args <args>         Extra mpirun args for servers.
     --clients <list>              List of clients.
     --clients-file <file>         File containing the client names (not implemented).
     --clients-nranks <num>        Number of MPI ranks per client.
+    --clients-args <args>         Extra mpirun args for clients.
     --niters <num>                Number of iterations.
     --nflight <num>               Number of infligh messages.
     --bsize <num>                 Buffer size (in byptes).
@@ -109,8 +130,7 @@ and 4 clients (1x IB FDR HCA per client). Because each server is dual-rail,
 we need at least 2 MPI ranks per server to get the full bandwidth.
 
 ```
-run_netsan.sh --servers "server[2-3]" --clients "client[1-4]" \
---servers-nranks 2
+run_netsan.sh --servers "server[2-3]" --clients "client[1-4]" --servers-nranks 2
 
 Servers(2): server2:2,server3:2
 Clients(8): client1,client2,client3,client4
@@ -202,13 +222,13 @@ Clients(8): client1,client2,client3,client4,client5,client6,client7,client8
 
 ## Known Issues
 
-- Q: When running the `network_sanitizer` with MVAPICH2 and multirail clients,
+- Q: When running the Network Sanitizer with MVAPICH2 and multirail clients,
   my clients receive a segmentation fault.
-  A: It's probably a but in MVAPICH2. Try running the `network_sanitizer` with
+  A: It's probably a but in MVAPICH2. Try running the Network Sanitizer with
   `--clients-args="-env MV2_NUM_HCAS 1"`.
 
 ## Known Limitations
 
-- Only runs with MVAPICH for now. This limitation is only due to the script
-`run_netsan.sh`, which exports a bunch of environment variables that can
-only be interpreted by MVAPICH.
+- Multiple rail configurations are supported only if MVAPICH is used.
+  OpenMPI should theoretically work, but I didn't manage to get a working
+  multirail configuration with it.
