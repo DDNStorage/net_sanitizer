@@ -547,6 +547,11 @@ static void help_usage(char *prog, FILE *stream)
     fprintf(stream, "Usage: %s [OPTIONS]\n", basename(prog));
     fprintf(stream, "\t-s, --nservers\tNumber of servers.\n");
     fprintf(stream, "\t-i, --niters\tNumber of iterations.\n");
+    fprintf(stream, "\t-f, --nflight\tNumber of max inflight messages per client.\n");
+    fprintf(stream, "\t-b, --bsize\tSize of network buffers to test (in bytes).\n");
+    fprintf(stream, "\t-n, --hostnames\tEnable hostname resulution with verbose mode.\n");
+    fprintf(stream, "\t-v, --verbose\tEnable verbose mode.\n");
+    fprintf(stream, "\t-h, --help\tHelp page.\n");
 }
 
 static void parse_args(int argc, char *argv[])
