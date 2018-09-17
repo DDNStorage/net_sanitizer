@@ -26,12 +26,52 @@ issues in a HPC cluster:
 
 - Multirail routing rules not correctly applied
 
+## Requirements
+
+The Network Sanitizer requires an MPI 3.x compatible runtime to be installed
+on all the nodes where the tool will be run. The tool has been successfully
+tested with MVAPICH2.2 with multiple rail configuration enabled.
+
+## Supported modes
 
 The tool allows 2 different modes:
 
 - *Client/server*: in this mode, the clients directly communicate with the
   servers. In other terms, there is no server-to-server nor client-to-client
-  communication. This mode supports
+  communication. In this mode, every server allocates an MPI RMA Window of
+  `128 x buffer_size`, where `128` represents the maximum inflight requests a
+  server can handle. In detail, the communication pattern mimics an RPC
+  protocol, which is implemented that way:
+
+```
+                Client                              Server
+                  |                                   |
+ Allocate RMA Win |                                   | Allocate RMA Win
+                  |                                   |
+          Irecv() |                                   | Irecv()
+                  |            RPC request            |
+          Isend() |---------------------------------->| Test()
+                  |                                   |
+                  |      RDMA Bulk data transfer      |
+                  |<--------------------------------->| Rput()/Rget()
+                  |                                   |
+                  |          RDMA completion          |
+                  |- - - - - - - - - - - - - - - - - >| Test()
+                  |                                   |
+                  |           RPC Response            |
+        Waitall() |<----------------------------------| Isend()
+                  |                                   |
+                  |                                   |
+                  v                                   v
+```
+  This mode *does support* multiple rail configurations with MVAPICH runtime.
+  If your servers support multiple rail configurations, you should set the
+  argument `--servers-nranks=` to match the number of HCAs on your servers.
+  MVAPICH will assign HCAs to the MPI ranks in a round-robin manner, where
+  the first HCA will be assigned to the first MPI rank created local MPI
+  rank, the second HCA to the second MPI rank and so on and so forth.
+  For more information about multiple rail configurations with MVAPICH, you can
+  refer to the chapters 6.12 and 6.13 of the [MVAPICH2 documentation](http://mvapich.cse.ohio-state.edu/static/media/mvapich/mvapich2-2.2-userguide.pdf)
 
 - *All-to-all*: in this mode, all the nodes take part of a all-to-all
   communication pattern. To avoid a heavy saturation of the network, each
@@ -159,6 +199,13 @@ Clients(8): client1,client2,client3,client4,client5,client6,client7,client8
 2097152       29.4      31371  409.74      15686
 4194304       58.2      31632  812.62       7908
 ```
+
+## Known Issues
+
+- Q: When running the `network_sanitizer` with MVAPICH2 and multirail clients,
+  my clients receive a segmentation fault.
+  A: It's probably a but in MVAPICH2. Try running the `network_sanitizer` with
+  `--clients-args="-env MV2_NUM_HCAS 1"`.
 
 ## Known Limitations
 
