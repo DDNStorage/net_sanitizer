@@ -25,6 +25,7 @@
 #define MPI_RANK_ANY -1
 
 #define MIN(a,b) (((a)<(b))?(a):(b))
+#define MAX(a,b) (((a)>(b))?(a):(b))
 
 enum output_mode
 {
@@ -53,8 +54,16 @@ do {                                                                           \
     if (rc) MPI_Abort(MPI_COMM_WORLD, rc);                                     \
 } while(0)
 
+enum operation
+{
+    OP_SUM = 0,
+    OP_MIN,
+    OP_MAX,
+    _OP_LAST,
+};
+
 MPI_Datatype results_dtype;
-MPI_Op       results_op_sum;
+MPI_Op       results_op[_OP_LAST];
 MPI_Comm     clients_comm = MPI_COMM_NULL;
 
 struct globals
@@ -112,15 +121,23 @@ const char * rstate_str[] =
     [STATE_RESP_POSTED] = "resp posted",
 };
 
+#define CONFIG_PRINT_HEADER                                                    \
+    "Dir size(B)"
+
+#define CONFIG_PRINT_FMT                                                       \
+    "%3s %7d"
+
+#define CONFIG_PRINT_ARGS(config)                                              \
+    direction_str[(config)->direction],                                        \
+    (config)->data_size
+
 #define RESULTS_PRINT_HEADER                                                   \
-    "Dir size(B)    time(s)   bw(MB/s) lat(us)    iops"
+    "   time(s)   bw(MB/s) lat(us)       iops"
 
 #define RESULTS_PRINT_FMT                                                      \
-    "%3s %7d %10.1f %10.0f %7.2f %10.0f\n"
+    "%10.1f %10.0f %7.2f %10.0f"
 
-#define RESULTS_PRINT_ARGS(config, res)                                        \
-    direction_str[(config)->direction],                                        \
-    (config)->data_size,                                                       \
+#define RESULTS_PRINT_ARGS(res)                                                \
     (res)->exec_time,                                                          \
     (res)->bw,                                                                 \
     (res)->latency,                                                            \
@@ -169,7 +186,9 @@ static void print_header_verbose(const struct test_config *config)
     if (client_rank != 0)
         return;
 
-   fprintf(stdout,"#             src             dest "RESULTS_PRINT_HEADER"\n");
+   fprintf(stdout,"#             src             dest "
+                  CONFIG_PRINT_HEADER" "
+                  RESULTS_PRINT_HEADER"\n");
    fflush(stdout);
 }
 
@@ -185,15 +204,17 @@ static void print_results_verbose(const struct test_config *config,
     MPI_CHECK(MPI_Comm_rank(clients_comm, &client_rank));
 
     if (!my.hostname_resolve)
-        fprintf(stdout," %16d %16d "RESULTS_PRINT_FMT,
+        fprintf(stdout," %16d %16d "CONFIG_PRINT_FMT" "RESULTS_PRINT_FMT"\n",
                         client_rank,
                         dst,
-                        RESULTS_PRINT_ARGS(config, input_res));
+                        CONFIG_PRINT_ARGS(config),
+                        RESULTS_PRINT_ARGS(input_res));
     else
-        fprintf(stdout," %16s %16s "RESULTS_PRINT_FMT,
+        fprintf(stdout," %16s %16s "CONFIG_PRINT_FMT" "RESULTS_PRINT_FMT"\n",
                         get_hostname(client_rank, true),
                         get_hostname(dst, false),
-                        RESULTS_PRINT_ARGS(config, input_res));
+                        CONFIG_PRINT_ARGS(config),
+                        RESULTS_PRINT_ARGS(input_res));
     fflush(stdout);
 }
 
@@ -459,14 +480,36 @@ static double run_test_client_server(struct test_config *config,
 static void reduce_results_sum(struct results *invec, struct results *inoutvec,
                                int *len, MPI_Datatype *dtype)
 {
-    int i;
-
-    for (i = 0; i < *len; i++)
+    for (int i = 0; i < *len; i++)
     {
         inoutvec[i].bw        += invec[i].bw;
         inoutvec[i].latency   += invec[i].latency;
         inoutvec[i].iops      += invec[i].iops;
         inoutvec[i].exec_time += invec[i].exec_time;
+    }
+}
+
+static void reduce_results_min(struct results *invec, struct results *inoutvec,
+                               int *len, MPI_Datatype *dtype)
+{
+    for (int i = 0; i < *len; i++)
+    {
+        inoutvec[i].bw        = MIN(invec[i].bw,        inoutvec[i].bw);
+        inoutvec[i].latency   = MIN(invec[i].latency,   inoutvec[i].latency);
+        inoutvec[i].iops      = MIN(invec[i].iops,      inoutvec[i].iops);
+        inoutvec[i].exec_time = MIN(invec[i].exec_time, inoutvec[i].exec_time);
+    }
+}
+
+static void reduce_results_max(struct results *invec, struct results *inoutvec,
+                               int *len, MPI_Datatype *dtype)
+{
+    for (int i = 0; i < *len; i++)
+    {
+        inoutvec[i].bw        = MAX(invec[i].bw,        inoutvec[i].bw);
+        inoutvec[i].latency   = MAX(invec[i].latency,   inoutvec[i].latency);
+        inoutvec[i].iops      = MAX(invec[i].iops,      inoutvec[i].iops);
+        inoutvec[i].exec_time = MAX(invec[i].exec_time, inoutvec[i].exec_time);
     }
 }
 
@@ -485,7 +528,11 @@ static void init_mpi(int argc, char *argv[], const int nservers)
     MPI_CHECK(MPI_Type_commit(&results_dtype));
 
     MPI_CHECK(MPI_Op_create((MPI_User_function *) reduce_results_sum, 1,
-                            &results_op_sum));
+                            &results_op[OP_SUM]));
+    MPI_CHECK(MPI_Op_create((MPI_User_function *) reduce_results_min, 1,
+                            &results_op[OP_MIN]));
+    MPI_CHECK(MPI_Op_create((MPI_User_function *) reduce_results_max, 1,
+                            &results_op[OP_MAX]));
 
     MPI_CHECK(MPI_Comm_rank(MPI_COMM_WORLD, &my.glob_rank));
     MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &my.glob_size));
@@ -512,7 +559,9 @@ static void destroy_mpi(void)
         clients_comm = MPI_COMM_NULL;
     }
 
-    MPI_CHECK(MPI_Op_free(&results_op_sum));
+    MPI_CHECK(MPI_Op_free(&results_op[OP_SUM]));
+    MPI_CHECK(MPI_Op_free(&results_op[OP_MIN]));
+    MPI_CHECK(MPI_Op_free(&results_op[OP_MAX]));
     MPI_CHECK(MPI_Type_free(&results_dtype));
     MPI_CHECK(MPI_Finalize());
 }
@@ -520,7 +569,7 @@ static void destroy_mpi(void)
 static void print_results_reduced(const struct test_config *config,
                                   const struct results *input_res)
 {
-    struct results output_res;
+    struct results output_res[_OP_LAST];
     int split_comm_rank;
 
     /* Not part of client communicator: return */
@@ -528,16 +577,29 @@ static void print_results_reduced(const struct test_config *config,
         return;
 
     MPI_CHECK(MPI_Comm_rank(clients_comm, &split_comm_rank));
-    MPI_CHECK(MPI_Reduce(input_res, &output_res, 1, results_dtype,
-                         results_op_sum, MPI_ROOT_RANK, clients_comm));
+    for (int op = 0; op < _OP_LAST; ++op)
+        MPI_CHECK(MPI_Reduce(input_res, &output_res[op], 1, results_dtype,
+                             results_op[op], MPI_ROOT_RANK, clients_comm));
 
     if (split_comm_rank == MPI_ROOT_RANK)
     {
         if (config->curr_iter == 0)
-            fprintf(stdout, RESULTS_PRINT_HEADER"\n");
+        {
+            fprintf(stdout, "                                  SUM                                     MIN                                      MAX                    \n");
+            fprintf(stdout, CONFIG_PRINT_HEADER" "
+                            RESULTS_PRINT_HEADER" "
+                            RESULTS_PRINT_HEADER" "
+                            RESULTS_PRINT_HEADER"\n");
+        }
 
-        fprintf(stdout, RESULTS_PRINT_FMT,
-                        RESULTS_PRINT_ARGS(config, &output_res));
+        fprintf(stdout, CONFIG_PRINT_FMT" "
+                        RESULTS_PRINT_FMT" "
+                        RESULTS_PRINT_FMT" "
+                        RESULTS_PRINT_FMT"\n",
+                        CONFIG_PRINT_ARGS(config),
+                        RESULTS_PRINT_ARGS(&output_res[OP_SUM]),
+                        RESULTS_PRINT_ARGS(&output_res[OP_MIN]),
+                        RESULTS_PRINT_ARGS(&output_res[OP_MAX]));
     }
 }
 
