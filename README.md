@@ -122,7 +122,7 @@ run_netsan.sh
     --clients-args <args>         Extra mpirun args for clients.
     --niters <num>                Number of iterations.
     --nflight <num>               Number of infligh messages.
-    --bsize <num>                 Buffer size (in byptes).
+    --bsize <num>                 Buffer size (in bytes).
     --verbose                     Enable verbose mode.
     --hostnames                   Use hostname resolution for MPI ranks.
     --help                        Print this help message.
@@ -197,7 +197,7 @@ Get 2097152        6.1      21508  148.78      10754
 Get 4194304       12.0      21874  292.59       5468
 ```
 
-- Run a all-to-all benchmark:
+- Run an all-to-all benchmark:
 
 ```
 run_netsan.sh --clients "client[1-8]"
@@ -229,6 +229,35 @@ Clients(8): client1,client2,client3,client4,client5,client6,client7,client8
 2097152       29.4      31371  409.74      15686
 4194304       58.2      31632  812.62       7908
 ```
+
+The all-to-all benchmark implements a `--verbose` option, which allows to dump
+all the performance metrics on a per-connection basis. This `--verbose` option
+is particularly interesting to investigate slow network links in a cluster.
+
+For example, let's consider this command line followed by it's corresponding
+output:
+```
+./run_netsan.sh --clients "client[1-4]" --clients-nranks 1 --hostname --verbose --bsize 4194304
+
+#nservers=0 nclients=4 niters=128 nflight=12 ssize=4194304, esize=4194304
+#             src             dest Dir size(B)    time(s)   bw(MB/s) lat(us)       iops
+        client2-1        client1-0 Und 4194304        0.1       5911   67.67       1478
+        client1-0        client2-1 Und 4194304        0.1       5911   67.67       1478
+        client4-3        client3-2 Und 4194304        0.1       3669  109.01        917
+        client3-2        client4-3 Und 4194304        0.1       3669  109.01        917
+        client4-3        client1-0 Und 4194304        0.1       6013   66.52       1503
+        client1-0        client4-3 Und 4194304        0.1       6013   66.52       1503
+        client2-1        client3-2 Und 4194304        0.1       3676  108.82        919
+        client3-2        client2-1 Und 4194304        0.1       3676  108.82        919
+        client4-3        client2-1 Und 4194304        0.1       5984   66.85       1496
+        client2-1        client4-3 Und 4194304        0.1       5985   66.84       1496
+        client1-0        client3-2 Und 4194304        0.1       3705  107.96        926
+        client3-2        client1-0 Und 4194304        0.1       3705  107.96        926
+```
+
+The output above clearly highlights a network issue with client3, since the tool
+detects a bandwidth of ~3.6 GB/s (instead of ~6 GB/s) every time the other
+client nodes communicate with client3.
 
 ## Known Issues
 
