@@ -91,8 +91,27 @@ struct results
     double exec_time;
 };
 
+enum test_mode
+{
+    TEST_MODE_CLIENT_SERVER,
+    TEST_MODE_ALL_TO_ALL,
+};
+
+enum peer_role
+{
+    PEER_RECV, /* current rank expects to receive data from peer */
+    PEER_SEND, /* current rank expects to send data to peer */
+};
+
+struct peer_entry
+{
+    int rank;
+    enum peer_role role;
+};
+
 struct test_config
 {
+    enum test_mode test_mode;
     int curr_iter;
     int data_size;
     int niters;
@@ -100,6 +119,9 @@ struct test_config
     enum direction direction;
     void *s_buffer;
     void *r_buffer;
+    /* All to all specific data */
+    struct peer_entry *peers_list; /* List of peers to communicate with */
+    /* Client server specific data */
     void *rdma_buffer;
     MPI_Win rdma_win;
 };
@@ -446,13 +468,15 @@ exit:
     return end - start;
 }
 
-static void init_test(const int curr_iter,
+static void init_test(enum test_mode test_mode,
+                      const int curr_iter,
                       const int niters,
                       const int nflight,
                       const int data_size,
                       const enum direction direction,
                       struct test_config *config)
 {
+    config->test_mode = test_mode;
     config->nflight   = nflight;
     config->niters    = niters;
     config->data_size = data_size;
@@ -689,7 +713,8 @@ static void test_client_server(int start_size, int end_size,
                                &test_config.rdma_win));
 
     /* Warmup test */
-    init_test(-1, NUM_RDMA_BUFFERS, nflight, 1, direction, &test_config);
+    init_test(TEST_MODE_CLIENT_SERVER,
+              -1, NUM_RDMA_BUFFERS, nflight, 1, direction, &test_config);
     run_test_client_server(&test_config, NULL);
 
     for (curr_size = start_size; curr_size <= end_size; curr_size *= 2)
@@ -697,7 +722,8 @@ static void test_client_server(int start_size, int end_size,
         struct results res;
         double exec_time = 0;
 
-        init_test(curr_iter++,
+        init_test(TEST_MODE_CLIENT_SERVER,
+                  curr_iter++,
                   my.niters, nflight, curr_size,
                   direction,
                   &test_config);
@@ -718,10 +744,76 @@ static void test_client_server(int start_size, int end_size,
     destroy_buffer(test_config.r_buffer);
 }
 
+static int alltoall_get_abs_rank(int rel_rank, int step, int size)
+{
+    return ((rel_rank - 1 - step + (size - 1)) % (size - 1)) + 1;
+}
+
+/* This function is used the generate a list of remote peers the current rank
+ * will be communicating with.
+ * This algorithm has been inspired from the 'linktest' tool from FZ Julich:
+ * http://www.fz-juelich.de/ias/jsc/EN/Expertise/Support/Software/LinkTest/_node.html
+ * It has been modified to be simpler to read and adapted to the need of the
+ * network sanitizer.
+ */
+static struct peer_entry *
+alltoall_get_peers(int rank, int size)
+{
+    int maxp = (int) (size / 2);
+    int from, to;
+
+    struct peer_entry *peers_list = malloc(sizeof(struct peer_entry) * size);
+    if (peers_list == NULL)
+        return NULL;
+
+    for (int step = 0; step < size; step++) {
+
+        for (int p = 0; p < (maxp - 1); p++) {
+            from = alltoall_get_abs_rank(maxp - p, step, size);
+            to = alltoall_get_abs_rank(maxp + 1 + p, step, size);
+
+            if (from == rank)
+            {
+                peers_list[step].rank = to;
+                peers_list[step].role = PEER_RECV;
+            }
+            if (to == rank)
+            {
+                peers_list[step].rank = from;
+                peers_list[step].role = PEER_SEND;
+            }
+        }
+
+        from = 0;
+        to = alltoall_get_abs_rank(1, step, size);
+
+        if (from == rank)
+        {
+            peers_list[step].rank = to;
+            peers_list[step].role = PEER_RECV;
+        }
+        if (to == rank)
+        {
+            peers_list[step].rank = from;
+            peers_list[step].role = PEER_SEND;
+        }
+    }
+    return peers_list;
+}
+
+#if 0
+static void alltoall_print_peers(struct peer_entry *peers_list, int size)
+{
+    for (int i = 0; i < size; i++)
+        fprintf(stderr, "%d ", peers_list[i].rank);
+    fprintf(stderr, "\n");
+}
+#endif
+
 static double run_test_alltoall(const struct test_config *config)
 {
     double start, end;
-    int distance, j, k;
+    int j, k;
     double total_exec_time = 0;
     int npeers = my.nclients;
 
@@ -731,15 +823,15 @@ static double run_test_alltoall(const struct test_config *config)
     char *s_buffer      = config->s_buffer;
     char *r_buffer      = config->r_buffer;
 
-    MPI_Request reqs[2 * nflight];
+    MPI_Request reqs[nflight + 1]; /* +1 for response message */
 
     if (my.output_mode == OUTPUT_VERBOSE)
         print_header_verbose(config);
 
-    for (distance = 1; distance < npeers; distance++)
+    for (int step = 0; step < npeers - 1; step++)
     {
-        int prev_rank = ((my.glob_rank - distance + npeers) % npeers);
-        int next_rank = (my.glob_rank + distance) % npeers;
+        int peer_rank = config->peers_list[step].rank;
+        enum peer_role peer_role = config->peers_list[step].role;
 
         MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
         MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
@@ -749,36 +841,46 @@ static double run_test_alltoall(const struct test_config *config)
 
         for (j = 0; j < niters; j++)
         {
-            MPI_CHECK(MPI_Irecv(&r_buffer[data_size * k], data_size,
-                                MPI_CHAR, prev_rank, 0, MPI_COMM_WORLD,
-                                &reqs[k]));
+            if (peer_role == PEER_RECV)
+                MPI_CHECK(MPI_Irecv(&r_buffer[data_size * k], data_size,
+                                    MPI_CHAR, peer_rank, 0, MPI_COMM_WORLD,
+                                    &reqs[k]));
+            else
+            {
+                assert(peer_role == PEER_SEND);
+                MPI_CHECK(MPI_Isend(&s_buffer[data_size * k], data_size,
+                                    MPI_CHAR, peer_rank, 0, MPI_COMM_WORLD,
+                                    &reqs[k]));
+            }
 
-            MPI_CHECK(MPI_Isend(&s_buffer[data_size * k], data_size,
-                               MPI_CHAR, next_rank, 0, MPI_COMM_WORLD,
-                               &reqs[nflight + k]));
-
-            /* Nflight reached or last iteration, now wait for all reqs to
-             * complete */
+            /* Nflight reached or last iteration, now send the response and wait
+             * for all reqs (including the response) to complete */
             if (++k >= nflight || (j == niters - 1))
             {
-                int sflag = 0, rflag = 0;
-                while (sflag == 0 || rflag == 0)
-                {
-                    if (rflag == 0)
-                    {
-                        MPI_CHECK(MPI_Testall(k, &reqs[nflight], &rflag,
-                                              MPI_STATUSES_IGNORE));
-                    }
-                    /* TODO: Register + report receive time */
+                char response = 'x';
+                const int resp_tag = 42;
 
-                    if (sflag == 0)
-                    {
-                        MPI_CHECK(MPI_Testall(k, &reqs[0], &sflag,
-                                              MPI_STATUSES_IGNORE));
-                        if (sflag == 1)
-                            end = MPI_Wtime();
-                    }
+                /* Send / Recv response */
+                if (peer_role == PEER_RECV)
+                {
+                    response = 'o';
+                    MPI_CHECK(MPI_Isend(&response, 1,
+                                        MPI_CHAR, peer_rank,
+                                        resp_tag, MPI_COMM_WORLD,
+                                        &reqs[k]));
                 }
+                else
+                {
+                    assert(peer_role == PEER_SEND);
+                    MPI_CHECK(MPI_Irecv(&response, 1,
+                                        MPI_CHAR, peer_rank,
+                                        resp_tag, MPI_COMM_WORLD,
+                                        &reqs[k]));
+                }
+
+                MPI_CHECK(MPI_Waitall(k + 1, &reqs[0], MPI_STATUSES_IGNORE));
+                assert(response == 'o');
+                end = MPI_Wtime();
                 k = 0;
             }
         }
@@ -789,7 +891,7 @@ static double run_test_alltoall(const struct test_config *config)
         {
             struct results res;
             generate_results(config, 1, (end - start), &res);
-            print_results_verbose(config, next_rank, &res);
+            print_results_verbose(config, peer_rank, &res);
         }
     }
 
@@ -806,9 +908,15 @@ static void test_alltoall(int start_size, int end_size)
     /* Allocate buffers */
     test_config.s_buffer = allocate_buffer(end_size * my.nflight);
     test_config.r_buffer = allocate_buffer(end_size * my.nflight);
+    test_config.peers_list = alltoall_get_peers(my.glob_rank, my.nclients);
+    assert(test_config.peers_list);
+#if 0
+    alltoall_print_peers(test_config.peers_list, my.nclients);
+#endif
 
     /* Warmup test */
-    init_test(-1, 2, my.nflight, end_size, DIR_NONE, &test_config);
+    init_test(TEST_MODE_ALL_TO_ALL,
+              -1, 2, my.nflight, end_size, DIR_NONE, &test_config);
     run_test_alltoall(&test_config);
 
     for (curr_size = start_size; curr_size <= end_size; curr_size *= 2)
@@ -816,7 +924,8 @@ static void test_alltoall(int start_size, int end_size)
         struct results res;
         double exec_time;
 
-        init_test(curr_iter++,
+        init_test(TEST_MODE_ALL_TO_ALL,
+                  curr_iter++,
                   my.niters, my.nflight, curr_size,
                   DIR_NONE,
                   &test_config);
@@ -834,6 +943,7 @@ static void test_alltoall(int start_size, int end_size)
 
     destroy_buffer(test_config.s_buffer);
     destroy_buffer(test_config.r_buffer);
+    free(test_config.peers_list);
 }
 
 void exchange_hostnames(void)
@@ -889,7 +999,15 @@ int main(int argc, char *argv[])
                         start_size, end_size);
 
     if (my.nservers <= 0)
+    {
+        if (my.nclients % 2)
+        {
+            fprintf(stderr,
+                    "Alltoall mode requires an even number of clients\n");
+            return EXIT_FAILURE;
+        }
         test_alltoall(start_size, end_size);
+    }
     else
     {
         test_client_server(start_size, end_size, DIR_PUT);
