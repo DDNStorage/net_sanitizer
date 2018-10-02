@@ -66,15 +66,16 @@ usage()
     echo "    --clients-args <args>         Extra mpirun args for clients."
     echo "    --niters <num>                Number of iterations."
     echo "    --nflight <num>               Number of infligh messages."
-    echo "    --bsize <num>                 Buffer size (in byptes)."
+    echo "    --bsize <num>                 Buffer size (in bytes)."
     echo "    --verbose                     Enable verbose mode."
     echo "    --hostnames                   Use hostname resolution for MPI ranks."
+    echo "    --sequential                  Use sequential mode, where only one pair of MPI ranks communicate at any time."
     echo "    --help                        Print this help message."
 }
 
 OPTS="$(getopt -o h,v -l servers:,servers-file:,niters:,\
 clients:,clients-file:,bsize:,help,nflight:,verbose,hostnames,\
-clients-nranks:,servers-nranks:,clients-args:,servers-args: -n "$0" -- "$@")"
+clients-nranks:,servers-nranks:,clients-args:,servers-args:,sequential -n "$0" -- "$@")"
 eval set -- "$OPTS"
 
 while true
@@ -121,6 +122,10 @@ do
            ;;
         --hostnames)
            NETSAN_OPTS+=" --hostnames "
+           shift
+           ;;
+        --sequential)
+           NETSAN_OPTS+=" --sequential "
            shift
            ;;
         --nflight)

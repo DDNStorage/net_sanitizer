@@ -76,11 +76,12 @@ struct globals
     int bsize;
     int nclients;
     bool hostname_resolve;
+    bool sequential_ios;
     char hostname[HOST_MAX_SIZE];
     char *hosts;
     enum output_mode output_mode;
 };
-#define GLOBALS_INIT { -1, -1, NITERS, NFLIGHT, 0, -1, 0, 0, {0}, NULL, OUTPUT_MPI}
+#define GLOBALS_INIT { -1, -1, NITERS, NFLIGHT, 0, -1, 0, false, false, {0}, NULL, OUTPUT_MPI}
 static struct globals my = GLOBALS_INIT;
 
 struct results
@@ -649,12 +650,13 @@ static void parse_args(int argc, char *argv[])
         { "help",       no_argument,       0, 'h' },
         { "bsize",      required_argument, 0, 'b' },
         { "hostnames",  no_argument,       0, 'n' },
+        { "sequential", no_argument,       0, 't' },
         { "verbose",    no_argument,       0, 'v' },
         { 0,            0,                 0, 0 }
     };
 
     while (1) {
-        int c = getopt_long(argc, argv, "s:i:h,f:,n",
+        int c = getopt_long(argc, argv, "s:i:h,f:,n,t",
                         long_options, NULL);
         if (c == -1)
             break;
@@ -675,6 +677,9 @@ static void parse_args(int argc, char *argv[])
                 break;
             case 'n':
                 my.hostname_resolve = true;
+                break;
+            case 't':
+                my.sequential_ios = true;
                 break;
             case 'h':
                 help_usage(argv[0], stdout);
@@ -810,12 +815,12 @@ static void alltoall_print_peers(struct peer_entry *peers_list, int size)
 }
 #endif
 
-static double run_test_alltoall(const struct test_config *config)
+static double run_test_alltoall_pair(
+        int peer_rank, enum peer_role peer_role,
+        const struct test_config *config)
 {
     double start, end;
-    int j, k;
-    double total_exec_time = 0;
-    int npeers = my.nclients;
+    int k = 0;
 
     const int niters    = config->niters;
     const int data_size = config->data_size;
@@ -824,6 +829,62 @@ static double run_test_alltoall(const struct test_config *config)
     char *r_buffer      = config->r_buffer;
 
     MPI_Request reqs[nflight + 1]; /* +1 for response message */
+
+    start = MPI_Wtime();
+
+    for (int j = 0; j < niters; j++)
+    {
+        if (peer_role == PEER_RECV)
+            MPI_CHECK(MPI_Irecv(&r_buffer[data_size * k], data_size,
+                                MPI_CHAR, peer_rank, 0, MPI_COMM_WORLD,
+                                &reqs[k]));
+        else
+        {
+            assert(peer_role == PEER_SEND);
+            MPI_CHECK(MPI_Isend(&s_buffer[data_size * k], data_size,
+                                MPI_CHAR, peer_rank, 0, MPI_COMM_WORLD,
+                                &reqs[k]));
+        }
+
+        /* Nflight reached or last iteration, now send the response and wait
+         * for all reqs (including the response) to complete */
+        if (++k >= nflight || (j == niters - 1))
+        {
+            char response = 'x';
+            const int resp_tag = 42;
+
+            /* Send / Recv response */
+            if (peer_role == PEER_RECV)
+            {
+                response = 'o';
+                MPI_CHECK(MPI_Isend(&response, 1,
+                                    MPI_CHAR, peer_rank,
+                                    resp_tag, MPI_COMM_WORLD,
+                                    &reqs[k]));
+            }
+            else
+            {
+                assert(peer_role == PEER_SEND);
+                MPI_CHECK(MPI_Irecv(&response, 1,
+                                    MPI_CHAR, peer_rank,
+                                    resp_tag, MPI_COMM_WORLD,
+                                    &reqs[k]));
+            }
+
+            MPI_CHECK(MPI_Waitall(k + 1, &reqs[0], MPI_STATUSES_IGNORE));
+            assert(response == 'o');
+            end = MPI_Wtime();
+            k = 0;
+        }
+    }
+
+    return (end - start);
+}
+
+static double run_test_alltoall(const struct test_config *config)
+{
+    double total_exec_time = 0, step_exec_time;
+    int npeers = my.nclients;
 
     if (my.output_mode == OUTPUT_VERBOSE)
         print_header_verbose(config);
@@ -834,63 +895,34 @@ static double run_test_alltoall(const struct test_config *config)
         enum peer_role peer_role = config->peers_list[step].role;
 
         MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
-        MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
-        start = MPI_Wtime();
-        k = 0;
-
-        for (j = 0; j < niters; j++)
+        if (my.sequential_ios)
         {
-            if (peer_role == PEER_RECV)
-                MPI_CHECK(MPI_Irecv(&r_buffer[data_size * k], data_size,
-                                    MPI_CHAR, peer_rank, 0, MPI_COMM_WORLD,
-                                    &reqs[k]));
-            else
+            for (int i = 0; i < npeers; i++)
             {
-                assert(peer_role == PEER_SEND);
-                MPI_CHECK(MPI_Isend(&s_buffer[data_size * k], data_size,
-                                    MPI_CHAR, peer_rank, 0, MPI_COMM_WORLD,
-                                    &reqs[k]));
-            }
+                MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
-            /* Nflight reached or last iteration, now send the response and wait
-             * for all reqs (including the response) to complete */
-            if (++k >= nflight || (j == niters - 1))
-            {
-                char response = 'x';
-                const int resp_tag = 42;
+                if (i == peer_rank)
+                    step_exec_time = run_test_alltoall_pair(peer_rank,
+                                                            PEER_SEND, config);
 
-                /* Send / Recv response */
-                if (peer_role == PEER_RECV)
-                {
-                    response = 'o';
-                    MPI_CHECK(MPI_Isend(&response, 1,
-                                        MPI_CHAR, peer_rank,
-                                        resp_tag, MPI_COMM_WORLD,
-                                        &reqs[k]));
-                }
-                else
-                {
-                    assert(peer_role == PEER_SEND);
-                    MPI_CHECK(MPI_Irecv(&response, 1,
-                                        MPI_CHAR, peer_rank,
-                                        resp_tag, MPI_COMM_WORLD,
-                                        &reqs[k]));
-                }
-
-                MPI_CHECK(MPI_Waitall(k + 1, &reqs[0], MPI_STATUSES_IGNORE));
-                assert(response == 'o');
-                end = MPI_Wtime();
-                k = 0;
+                if (i == my.glob_rank)
+                    step_exec_time = run_test_alltoall_pair(peer_rank,
+                                                            PEER_RECV, config);
             }
         }
+        else
+        {
+            step_exec_time = run_test_alltoall_pair(peer_rank,
+                                                    peer_role, config);
+        }
 
-        total_exec_time += (end - start);
+        total_exec_time += step_exec_time;
 
         if (my.output_mode == OUTPUT_VERBOSE)
         {
             struct results res;
-            generate_results(config, 1, (end - start), &res);
+            generate_results(config, 1, step_exec_time, &res);
             print_results_verbose(config, peer_rank, &res);
         }
     }
@@ -994,9 +1026,9 @@ int main(int argc, char *argv[])
 
     if (my.glob_rank == 0)
         fprintf(stdout, "#nservers=%i nclients=%d niters=%d nflight=%d "
-                        "ssize=%d, esize=%d\n",
+                        "sequential=%d ssize=%d, esize=%d\n",
                         my.nservers, my.nclients, my.niters, my.nflight,
-                        start_size, end_size);
+                        my.sequential_ios, start_size, end_size);
 
     if (my.nservers <= 0)
     {
