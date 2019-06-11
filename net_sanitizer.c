@@ -830,7 +830,7 @@ static double run_test_alltoall_pair(
 
     MPI_Request reqs[nflight + 1]; /* +1 for response message */
 
-    start = MPI_Wtime();
+    end = start = MPI_Wtime(); /* Make sure 'end' gets always initialized */
 
     for (int j = 0; j < niters; j++)
     {
