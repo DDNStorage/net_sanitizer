@@ -883,7 +883,7 @@ static double run_test_alltoall_pair(
 
 static double run_test_alltoall(const struct test_config *config)
 {
-    double total_exec_time = 0, step_exec_time;
+    double total_exec_time = 0, step_exec_time = 0;
     int npeers = my.nclients;
 
     if (my.output_mode == OUTPUT_VERBOSE)
